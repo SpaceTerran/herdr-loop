@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Entry point for hl-watchdog; the code is in hl/watchdog.py."""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from hl.watchdog import main  # noqa: E402
+
+sys.exit(main())

@@ -1,0 +1,55 @@
+#!/usr/bin/python3
+"""PreToolUse hook for a worker's Agent tool. Read by Claude Code, not by a person.
+
+    agent-guard <allowed type> [<allowed type> ...]
+
+A worker may hand work to the kit's own sub-agents and to no other kind, and
+always in the foreground, on its own model:
+
+- a sub-agent left running in the background while the worker's turn ends is
+  work nobody is waiting for: the done file is what says a worker finished;
+- a per-call model would let a worker spend another model's allowance;
+- an isolated worktree would put changes where the pull request is not.
+
+So the call is rewritten before it runs: `run_in_background` false, and no
+`model`, `effort`, `isolation` or `name`. A type that is not allowed is denied
+with the reason. Anything this hook cannot read is denied: a worker without
+sub-agents still works, a worker with unguarded ones may not finish.
+"""
+import json
+import sys
+
+STRIPPED = ("model", "effort", "isolation", "name", "mode", "team_name")
+
+
+def decide(event: dict, allowed: set) -> dict:
+    tool_input = event.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return {"permissionDecision": "deny", "permissionDecisionReason": "the sub-agent call could not be read"}
+    kind = tool_input.get("subagent_type")
+    if kind not in allowed:
+        names = ", ".join(sorted(allowed)) or "none"
+        return {
+            "permissionDecision": "deny",
+            "permissionDecisionReason": f"only these sub-agent types are open to this session: {names}. Name one as subagent_type, or do the work yourself.",
+        }
+    updated = {key: value for key, value in tool_input.items() if key not in STRIPPED}
+    updated["run_in_background"] = False
+    return {"permissionDecision": "allow", "updatedInput": updated}
+
+
+def main() -> int:
+    try:
+        try:
+            event = json.load(sys.stdin)
+        except ValueError:
+            event = {}
+        decision = decide(event if isinstance(event, dict) else {}, set(sys.argv[1:]))
+    except Exception as failure:  # whatever went wrong in here, the call it guards does not go ahead
+        decision = {"permissionDecision": "deny", "permissionDecisionReason": f"the sub-agent guard failed ({type(failure).__name__}); do the work yourself"}
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", **decision}}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Installed in a loop's own clone (never in a shared checkout):
+#   cp <kit>/scripts/hooks/commit-msg <clone>/.git/hooks/commit-msg
+# Refuses a commit whose message carries AI attribution. A tool can add its
+# trailer on the command line whatever its settings say; this stops it at the
+# commit, where the worker sees the refusal and commits again without it.
+# hl-merge reads every commit again before anything merges.
+if grep -Eiq 'co-authored-by:.*(claude|cursor|codex|copilot|anthropic|openai)|generated with \[?(claude|cursor|codex)|made with \[?cursor' "$1"; then
+  echo "commit refused: the message carries AI attribution (a Co-authored-by line naming a tool, or a 'Generated with' line)." >&2
+  echo "Commit again without it. Never pass --trailer to git commit." >&2
+  exit 1
+fi

@@ -1,0 +1,50 @@
+{
+  "program": "example",
+  "root": "/Users/you/loops/example",
+  "ledger_branch": "example-ledger",
+  "repo": "your-name/hello-api",
+  "base": "main",
+  "streams": [
+    {
+      "name": "api",
+      "writable": "`app/**`, `tests/**`, `infra/**`",
+      "ports": "`EX-nn` serves on `85nn`.",
+      "run": {
+        "id": "api-1",
+        "work": "Hello API clean-up",
+        "file": "EXAMPLE-ITEMS.md"
+      },
+      "port_base": 8500
+    }
+  ],
+  "settings": {
+    "claude_config_dir": "~/.claude-seat-a",
+    "ntfy_url": "https://ntfy.sh/your-private-topic",
+    "ntfy_user": "your-ntfy-user",
+    "ntfy_password_ref": "file:~/.config/herdr-loop/ntfy-password"
+  },
+  "prompt": {
+    "FILES_AND_GATES": "One backlog file: `{{TASK_DIR}}/EXAMPLE-ITEMS.md`, run `api-1`, run directory `{{ROOT}}/runs/api-1`. No gates: the program is complete when every item in it has merged and passed its Verify line.",
+    "PRODUCTION_BOUNDARY": "`your-name/hello-api` deploys to production on every push to `main`, through its `deploy.yml` workflow. That deploy, and the program's own pull requests, are the program's to make. The production database, its data and its backups are not: no item reads or writes them, and no item changes the Terraform state outside the plan its pull request shows.",
+    "CAPACITY": "One stream. Before every spawn, start nothing if the host has under 20 % free memory.",
+    "ACCOUNT_SHARING": "Nobody else uses the program's seats while it runs."
+  },
+  "repos": {
+    "your-name/hello-api": {
+      "facts": [
+        "CI runs Python 3.13; use it locally too.",
+        "A new route is added to the list in `tests/test_routes_inventory.py`."
+      ],
+      "setup": "python3 -m venv .venv && .venv/bin/pip install -q -r requirements.txt",
+      "setup_inputs": ["requirements.txt"],
+      "ci_covers": [
+        "`test`: the full pytest suite and ruff",
+        "`plan`: terraform plan for `infra/`"
+      ],
+      "not_in_ci": [],
+      "seen": [],
+      "protected": ["requirements.lock", ".github/workflows/**"],
+      "deploys": ["deploy.yml"]
+    }
+  }
+}

@@ -1,0 +1,9 @@
+## The required checks on your build are not green
+
+The pull request's required checks finished and at least one failed. `{{CHECKS_FILE}}` lists them, with the command that prints each failed run's log. Nothing merges until every required check is green on the commit that merges, so this is yours to fix now.
+
+- Read the failed runs before you change anything, then fix the cause. List every test and step that failed, in every failed run, and fix all of them in this one push: a push that fixes the first failure and leaves the second costs another full round of checks and comes back to you again.
+- A test that fails because it asserts the behaviour this item changes, or holds a list the item added to, is fixed by updating that test to the new behaviour, in this pull request, wherever the test lives. Search the tests for anything else that asserts the same thing (`grep -rn` for the name, route or message) and update those too, so the next run does not find one more. That is not weakening a test: it goes on guarding the behaviour, as the item now defines it. A test is deleted only when the item removes the very thing it tests.
+- A check that fails in something your change did not touch is still yours to look at: your change may have broken it. If the same check fails on `origin/{{BASE}}` without your change, say so in your report with the command that shows it, and change nothing for it.
+- Never skip, weaken or delete a test to turn a check green. If you are convinced a check is wrong, leave it failing and say why in your report.
+- Commit and push to the same branch. The pull request stays the same one; update its self-check table by writing the whole body again (`gh api --method PATCH repos/{{REPO}}/pulls/<number> -F body=@<file>`; `gh pr edit` does not work with this loop's token).

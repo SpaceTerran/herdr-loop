@@ -1,0 +1,65 @@
+{
+  "program": "<short name, lower case: it names the agents and the watchdog, e.g. helpdesk>",
+  "root": "/Users/<you>/loops/<program>",
+  "ledger_branch": "<program>-ledger",
+  "repo": "<owner/name of the target repository; a stream may name its own>",
+  "base": "main",
+  "streams": [
+    {
+      "name": "<stream, e.g. portal>",
+      "writable": "<the paths this stream may write, e.g. `portal/**`, `shared/ui/**`>",
+      "ports": "<how an item's port is worked out, for people: `HD-nn` serves on `84nn`. With `port_base` the scripts work it out: base plus the item's number. Leave `port_base` out for a stream that serves nothing.>",
+      "run": {
+        "id": "<run id, e.g. portal-1>",
+        "work": "<what this run completes, as the operator would say it: Help desk portal>",
+        "file": "<the stream's first backlog file, beside this spec>"
+      },
+      "port_base": 8400
+    }
+  ],
+  "settings": {
+    "claude_config_dir": "<optional: the seat the program starts on, one of the template's `claude_seats` (a ~/.claude-<name> directory with its own Claude sign-in); leave the key out to start on the first of them. Never the host's default ~/.claude: that sign-in is the operator's own>",
+  "outside_prs": "<optional: `adopt` or `off` (merge no pull request a steward labels rollout-ready); leave the key out for the template's `off` on a new program, or for what a program staged again already has>",
+  "outside_pr_vetters": [
+   "<the GitHub login a steward labels and comments with; only these count, and none named (the key left out) means nothing is adopted. Staging takes them from this spec alone, so removing one here revokes it>"
+  ],
+  "outside_pr_shared_login": "<optional: `accept` only if the stewards' login is also the one the loop's token acts as, knowing a worker could then mark its own pull request ready (every such merge then says so, and the ledger shows it); left out, `refuse`: nothing merges in that case. Staging takes it from this spec alone>"
+  },
+  "prompt": {
+    "FILES_AND_GATES": "<every backlog file in order, each with its run id and run directory, and the gates between them, each written for the manager to get done (references/authoring.md, Gates are the manager's). {{ROOT}} and {{TASK_DIR}} are filled in.>",
+    "PRODUCTION_BOUNDARY": "<what is production and must not be touched, and what is the program's to change; never a credential or a gate put out of the manager's reach>",
+    "CAPACITY": "<how many streams and workers at once, and the measurement that decides: start nothing under 20 % free memory>",
+    "ACCOUNT_SHARING": "<who else uses the workers' Claude account while this runs>",
+    "ROUTING_NOTES": "<optional: what this program's manager should know when it routes, beyond the kit's defaults; leave the key out for none>"
+  },
+  "repos": {
+    "<owner/name>": {
+      "facts": [
+        "<a sentence every worker in this repository is told: a tool version CI uses, a condition of the test host that is known and is not a finding>"
+      ],
+      "setup": "<one command line that makes a fresh checkout ready (dependencies installed), writing only paths git ignores>",
+      "setup_inputs": [
+        "<each file that command's result depends on: lockfiles, requirement files>"
+      ],
+      "ci_covers": [
+        "<`check name`: what that required check runs>"
+      ],
+      "not_in_ci": [
+        "<a suite no required check runs, as the command that runs it>"
+      ],
+      "seen": [
+        "<glob of paths that hold what a person sees: templates, styles, components>"
+      ],
+      "protected": [
+        "<glob of paths no item may change: generated or pinned files>"
+      ],
+      "exemptable": [
+        "<optional: glob of protected paths the manager may exempt for one named item (`hl-items exempt`); leave the key out for none>"
+      ],
+      "reference": "<optional: one directory of the repository holding the pages a look is compared with, such as `brand`; served beside a looked-at build. Leave the key out for none>",
+   "deploys": [
+    "<the workflow file that deploys the repository on a push to the base, such as `apply-main.yml`: an outside pull request's deploy check reads its runs. `[]` where a merge deploys nothing; left out, no outside pull request merges in this repository>"
+   ]
+    }
+  }
+}
