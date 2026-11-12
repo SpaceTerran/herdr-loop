@@ -6,7 +6,7 @@ The rule the kit hangs on: **a script may refuse; it may not decide.** Judgment 
 
 The write-up, with the reasoning, the figures and the numbers, is on the blog: [The Herdr Loop: One Opus Manager, a Herd of Coding Sessions](https://spaceterran.com/posts/herdr-loop-claude-code-manager/).
 
-> **This is version five, and it moves.** This is a copy of the kit I run my own repos with, cleaned of my hosts, accounts and project names. I change it every week as models and tools change. It's shared so you can read it, borrow from it, and run it if you want to. It isn't a product, and there's no support promise. Issues and ideas are welcome.
+> **This is a snapshot, and it moves.** It's the latest of several loop systems I've built, copied from the kit I run my own repos with and cleaned of my hosts, accounts and project names. I change it every week as models and tools change. It's shared so you can read it, borrow from it, and run it if you want to. It isn't a product, and there's no support promise. Issues and ideas are welcome.
 
 ## What's in here
 
