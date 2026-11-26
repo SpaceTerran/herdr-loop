@@ -23,12 +23,18 @@ MARKER_DEPENDS = "**Depends.**"
 MARKER_NOT = "**Not.**"
 MARKER_VERIFY = "**Verify.**"
 MARKER_FLOOR = "**Floor.**"
+MARKER_ORIGIN = "**Origin.**"
 
 # What an item's author may require of how the item is routed, whatever the
 # manager would choose by itself: an independent premise check before the
 # build, a look in a real browser at the review, a Sonnet builder from the
 # first build. The manager may go above a floor and never below it.
 FLOORS = ("premise", "look", "sonnet")
+
+# Where an item came from, said by whoever writes it: new work, the repair of an item named by its id, a finding
+# of an audit, or a change to a rule. Counted over the program's merged items (`velocity.origins`): how much of the
+# work is repair, and how many defects are found per 100 merged items.
+ORIGINS = ("new", "repair", "audit", "rule")
 
 VERIFY_COMMAND_RE = re.compile(r"^\*\*Verify\.\*\*\s+`([^`\n]+)`\s*$")
 VERIFY_WAIT_RE = re.compile(r"^Wait\.\s*(\S+)\s*$")
@@ -50,6 +56,7 @@ class Item:
     verify_command: str | None = None
     verify_wait_min: int | None = None
     floor: list[str] = field(default_factory=list)
+    origin: dict | None = None
 
 
 def parse_backlog(text: str) -> list[Item]:
@@ -97,6 +104,7 @@ def parse_backlog(text: str) -> list[Item]:
                 verify_command=verify_command,
                 verify_wait_min=verify_wait_min,
                 floor=_floor(blocks, item_id),
+                origin=_origin(blocks, item_id),
             )
         )
     return items
@@ -230,6 +238,63 @@ def _floor(blocks: list[list[str]], item_id: str) -> list[str]:
             )
         return [f for f in FLOORS if f in words]
     return []
+
+
+def _origin(blocks: list[list[str]], item_id: str) -> dict | None:
+    """`**Origin.** repair: HD-12, its empty state` gives the kind before the
+    first colon and what it names after it. `new` may stand alone; `repair`
+    names the item it repairs by its id; `audit` and `rule` say which. A line
+    that does not is refused: a count of origins is only as good as its words.
+    An item without the line has no origin on record (None)."""
+    for block in blocks:
+        joined = _joined(block)
+        if not joined.startswith(MARKER_ORIGIN):
+            continue
+        said = joined[len(MARKER_ORIGIN) :].strip()
+        kind, _, what = said.partition(":")
+        kind, what = kind.strip().rstrip(".").strip().lower(), what.strip()
+        named = kind == "new" or (bool(what) and (kind != "repair" or bool(ID_RE.search(what))))
+        if kind not in ORIGINS or not named:
+            raise BacklogError(
+                f"{item_id}: malformed {MARKER_ORIGIN} line: expected `new`, `repair: <the id of the item it repairs>`, "
+                f"`audit: <which audit>` or `rule: <which rule>`; got {said!r}"
+            )
+        return {"kind": kind, "what": what or None}
+    return None
+
+
+MARKER_NAME_RE = re.compile(r"^\*\*([^*]+?)\.\*\*\s*")
+# Read whole elsewhere: the Accept list is the contract, and the Verify block is `verify_command`.
+NOT_FIELDS = ("Accept", "Verify")
+
+
+def item_fields(text: str) -> dict:
+    """What a manager reads off an item's text before it routes and builds
+    it: the Scope whole, every paragraph down to the next `**Marker.**` one
+    (where a program writes what an item may write), and the paragraph of
+    each other marker by its name (`Depends`, `Floor`, and any a program
+    adds of its own, such as `Size`). On the help-desk catalog program in the week to
+    2026-11-19 the manager read these by hand 422 times."""
+    scope: list[str] = []
+    markers: dict[str, str] = {}
+    current = None
+    for block in _split_blocks(text.splitlines()):
+        if HEADING_RE.match(block[0]):
+            block = block[1:]
+            if not block:
+                continue
+        m = MARKER_NAME_RE.match(block[0].strip())
+        if m:
+            current = m.group(1)
+            rest = [block[0].strip()[m.end() :]] + block[1:]
+            if current == "Scope":
+                scope.append("\n".join(rest).strip())
+            elif current not in NOT_FIELDS and current not in markers:
+                markers[current] = _joined(rest)
+            continue
+        if current == "Scope":
+            scope.append("\n".join(block))
+    return {"scope": "\n\n".join(p for p in scope if p) or None, "markers": markers}
 
 
 def without_verify(text: str) -> str:

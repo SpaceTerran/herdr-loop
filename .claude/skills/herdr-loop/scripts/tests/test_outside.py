@@ -20,7 +20,7 @@ from unittest import mock
 from hl import items, ledger, merge, outside
 from hl.common import Refusal, read_json, utc_now, write_json
 
-from .support import BACKLOG_A
+from .support import BACKLOG_A, with_queue
 from .test_merge import TEST_REF, MergeCase, git
 
 FAKE_GH = r'''#!/usr/bin/env python3
@@ -100,6 +100,7 @@ if args[:2] == ["pr", "comment"]:
 sys.stderr.write("fake gh: unexpected " + " ".join(args) + "\n")
 done(64)
 '''
+FAKE_GH = with_queue(FAKE_GH)
 
 BRANCH = "secfix/pillow-13"
 
@@ -1139,9 +1140,19 @@ class DeclineTest(unittest.TestCase):
         out = outside.decline(self.CFG, "owner/helpdesk", 800, "  conflicts with HD-23,\n in review now  ", gh)
         self.assertEqual((out["result"], out["repo"], out["reason"]), ("declined", "Owner/helpdesk", "conflicts with HD-23, in review now"))
         self.assertEqual(gh.calls[1][:3], ["label", "create", "rollout-held"])
-        self.assertEqual(gh.calls[2], ["pr", "edit", "800", "--repo", "Owner/helpdesk", "--remove-label", "rollout-ready", "--add-label", "rollout-held"])
-        body = gh.calls[3][gh.calls[3].index("--body") + 1]
-        self.assertIn("Passed over for now by the helpdesk-catalog loop: conflicts with HD-23, in review now", body)
+        # Through the REST issues API, never `gh pr edit` (refused for a token without `read:org`);
+        # `rollout-held` on before `rollout-ready` off, so a stop between them leaves it held.
+        self.assertEqual(gh.calls[2], ["api", "--method", "POST", "repos/Owner/helpdesk/issues/800/labels", "-f", "labels[]=rollout-held"])
+        self.assertEqual(gh.calls[3], ["api", "--method", "DELETE", "repos/Owner/helpdesk/issues/800/labels/rollout-ready"])
+        self.assertEqual(gh.calls[4][:4], ["api", "--method", "POST", "repos/Owner/helpdesk/issues/800/comments"])
+        body = gh.calls[4][gh.calls[4].index("-f") + 1]
+        self.assertTrue(body.startswith("body=Passed over for now by the helpdesk-catalog loop: conflicts with HD-23, in review now"), body)
+        self.assertFalse(any(c[:2] in (["pr", "edit"], ["pr", "comment"]) for c in gh.calls))
+
+    def test_a_ready_label_already_off_is_not_a_failure(self):
+        gone = (1, "", '{"message":"Label does not exist","status":"404"}gh: Label does not exist (HTTP 404)')
+        gh = fake({**self.READY, ("api", "--method", "DELETE"): gone})
+        self.assertEqual(outside.decline(self.CFG, "Owner/helpdesk", 800, "later", gh)["result"], "declined")
 
     def test_a_label_that_exists_is_used(self):
         gh = fake({**self.READY, ("label", "create"): (1, "", 'label with name "rollout-held" already exists')})
@@ -1157,14 +1168,22 @@ class DeclineTest(unittest.TestCase):
                 outside.decline(self.CFG, repo, 800, reason, fake(dict(self.READY)))
             self.assertIn(said, str(caught.exception))
         with self.assertRaises(Refusal) as caught:
-            outside.decline(self.CFG, "Owner/helpdesk", 800, "later", fake({**self.READY, ("pr", "edit"): (1, "", "HTTP 403")}))
+            outside.decline(self.CFG, "Owner/helpdesk", 800, "later", fake({**self.READY, ("api", "--method", "POST", "repos/Owner/helpdesk/issues/800/labels"): (1, "", "HTTP 403")}))
         self.assertIn("could not be relabeled: HTTP 403", str(caught.exception))
+        gh = fake({**self.READY, ("api", "--method", "DELETE"): (1, "", "HTTP 502")})
+        with self.assertRaises(Refusal) as caught:
+            outside.decline(self.CFG, "Owner/helpdesk", 800, "later", gh)
+        self.assertIn("carries `rollout-held` now, but `rollout-ready` could not be taken off: HTTP 502", str(caught.exception))
+        self.assertFalse(any("comments" in " ".join(c) for c in gh.calls))  # no reason posted for a half-done relabel
+        with self.assertRaises(Refusal) as caught:
+            outside.decline(self.CFG, "Owner/helpdesk", 800, "later", fake({**self.READY, ("api", "--method", "POST", "repos/Owner/helpdesk/issues/800/comments"): (1, "", "HTTP 500")}))
+        self.assertIn("was relabeled, but the reason could not be posted: HTTP 500", str(caught.exception))
         # An item's own pull request, or anything else not marked ready, is never relabeled here.
         gh = fake({("pr", "view"): (0, json.dumps({"labels": [], "state": "OPEN"}), "")})
         with self.assertRaises(Refusal) as caught:
             outside.decline(self.CFG, "Owner/helpdesk", 801, "later", gh)
         self.assertIn("does not carry `rollout-ready`", str(caught.exception))
-        self.assertFalse(any(c[:2] in (["pr", "edit"], ["label", "create"]) for c in gh.calls))
+        self.assertFalse(any(c[:1] == ["api"] or c[:2] == ["label", "create"] for c in gh.calls))
 
     def test_the_command_line(self):
         with tempfile.TemporaryDirectory() as tmp:

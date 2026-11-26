@@ -660,22 +660,22 @@ class ClaudeHomeTest(WatchdogCase):
         super().setUp()
         from hl.common import read_json
 
-        self.team = self.home / ".claude-team"
-        self.team.mkdir()
-        write_json(self.team / ".claude.json", {"oauthAccount": {"emailAddress": "loops@example.invalid"}})
-        write_json(self.root / "program.json", {**read_json(self.root / "program.json"), "claude_config_dir": str(self.team)})
+        self.loop_home = self.home / ".claude-loop"
+        self.loop_home.mkdir()
+        write_json(self.loop_home / ".claude.json", {"oauthAccount": {"emailAddress": "loops@example.invalid"}})
+        write_json(self.root / "program.json", {**read_json(self.root / "program.json"), "claude_config_dir": str(self.loop_home)})
 
     def test_the_manager_is_started_on_the_programs_sign_in(self):
         result = self.tick()
         self.assertEqual(result["action"], "started")
         ran = self.herdr.panes[result["pane"]]["ran"]
         self.assertEqual(len(ran), 1)
-        self.assertIn(f"export CLAUDE_CONFIG_DIR={self.team};", ran[0])
+        self.assertIn(f"export CLAUDE_CONFIG_DIR={self.loop_home};", ran[0])
         order = [c[:2] for c in self.herdr.calls]
         self.assertLess(order.index(("pane", "run")), order.index(("agent", "start")))
 
     def test_a_sign_in_that_does_not_load_starts_no_manager(self):
-        self.herdr.home_say = f"hl-home FAILED {{nonce}}: no Claude sign-in in {self.team}"
+        self.herdr.home_say = f"hl-home FAILED {{nonce}}: no Claude sign-in in {self.loop_home}"
         result = self.tick()
         self.assertEqual(result["action"], "start-failed")
         self.assertIn("did not load", result["detail"])

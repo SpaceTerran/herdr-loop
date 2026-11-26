@@ -28,7 +28,7 @@ You will build one backlog item in an unattended build loop. Before any code is 
 - At most ten criteria, numbered `1.` onward at the start of the line. Steps inside a criterion are bullets, never a nested numbered list.
 - Every criterion is something a reviewer can check by exercising the build: with a shell, the checkout, a browser and `gh`. It states behaviour: not prose to be judged, and not "the code contains X" unless the item asks for exactly that. Leave suites and required checks out of the criteria: a script holds the required checks green at the merge.
 - Every literal you write (a path, a name, a count, a status code) is one you checked in the checkout or one the build will create. Say which.
-- A builder changing only the files the item lets it write must be able to make every criterion pass.
+- A builder changing only the files the item lets it write must be able to make every criterion pass.{{WRITE_LIST_CONTRACT}}
 - Cover what the item asks. Do not add work the item does not ask for, and do not leave out a behaviour because it is hard to check: find the check.
 - Repository settings, secrets and anything outside the repository are never criteria.
 

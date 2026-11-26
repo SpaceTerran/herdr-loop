@@ -104,8 +104,27 @@ def unstarted_files(root, ledger_file, archive_file=None) -> dict:
     return out
 
 
+def passed_unmerged(run_dir, item_id: str) -> str | None:
+    """When an item's newest attempt, a review, was read as a pass, if the
+    item has not merged since and nothing was started for it after: the
+    item is finished and only waits to merge. None for anything else, and
+    for an item whose pull request is in the base's merge queue
+    (`merge.json` QUEUED): that merge is under way, and nothing the manager
+    can do moves it."""
+    log = [e for e in items.load_attempts(run_dir, item_id)["log"] if not e.get("voided")]
+    if not log or log[-1]["phase"] != "grade":
+        return None
+    read = log[-1].get("read") or {}
+    if read.get("effective") != "PASS":
+        return None
+    d = items.item_dir(run_dir, item_id)
+    if (d / "merge.json").exists() and read_json(d / "merge.json").get("state") in ("MERGED", "QUEUED"):
+        return None
+    return read.get("at") or log[-1].get("at")
+
+
 def idle_streams(root, streams, at: str) -> dict:
-    """The streams with no item in progress at `at`: since when, and how
+    """The streams with no item being worked at `at`: since when, and how
     many items still wait in their runs.
 
     A stream is one clone that works one item at a time, so a stream with
@@ -115,32 +134,48 @@ def idle_streams(root, streams, at: str) -> dict:
     read at a save said so. `since` is the last time anything of the stream
     changed (an item merged, failed, was parked or skipped, or a run was
     made); a stream between a merge and its next item's first worker is
-    listed too. A run that names no stream of the program cannot be counted
-    for one: it is named under `runs_outside_streams` while it has items
-    to work, so the list is never read as complete when it is not. This is
-    a fact for the manager: nothing here decides what an idle stream should
-    do."""
-    seen = {name: {"in_progress": 0, "pending": 0, "last": None} for name in streams}
+    listed too. A stream whose only items in progress passed their review
+    and wait to merge is listed as well, with those items under
+    `waiting_to_merge` and the minutes since each passed: on
+    the help-desk catalog program (2026-11-17) streams held finished items about 60 %
+    of the day behind one merge per deploy, and counted as at work. An item
+    in the base's merge queue counts as at work: its merge is under way. A run that names no stream of the
+    program cannot be counted for one: it is named under
+    `runs_outside_streams` while it has items to work, so the list is never
+    read as complete when it is not. This is a fact for the manager: nothing
+    here decides what an idle stream should do."""
+    seen = {name: {"working": 0, "waiting": [], "pending": 0, "last": None} for name in streams}
     outside = []
     for run_dir in run_dirs(root):
         run = items.load_run(run_dir)
-        statuses = [items.load_item(run_dir, item_id)["status"] for item_id in run["order"]]
+        statuses = {item_id: items.load_item(run_dir, item_id)["status"] for item_id in run["order"]}
         stream = seen.get(run.get("stream"))
         if stream is None:
-            if any(s in ("in_progress", "pending") for s in statuses):
+            if any(s in ("in_progress", "pending") for s in statuses.values()):
                 outside.append(run["run_id"])
             continue
-        for status in ("in_progress", "pending"):
-            stream[status] += statuses.count(status)
+        stream["pending"] += list(statuses.values()).count("pending")
+        for item_id, status in statuses.items():
+            if status != "in_progress":
+                continue
+            passed = passed_unmerged(run_dir, item_id)
+            if passed is None:
+                stream["working"] += 1
+            else:
+                minutes = _minutes(passed, at)
+                stream["waiting"].append({"id": item_id, "passed": passed, "minutes": None if minutes is None else int(minutes)})
         for stamp in [run.get("created")] + [e.get("at") for e in run.get("events", [])]:
             if _epoch(stamp) is not None and (stream["last"] is None or _epoch(stamp) > _epoch(stream["last"])):
                 stream["last"] = stamp
     listed = []
     for name, stream in seen.items():
-        if stream["in_progress"]:
+        if stream["working"]:
             continue
         minutes = _minutes(stream["last"], at)
-        listed.append({"stream": name, "since": stream["last"], "minutes": None if minutes is None else int(minutes), "pending": stream["pending"]})
+        entry = {"stream": name, "since": stream["last"], "minutes": None if minutes is None else int(minutes), "pending": stream["pending"]}
+        if stream["waiting"]:
+            entry["waiting_to_merge"] = stream["waiting"]
+        listed.append(entry)
     out: dict = {"streams": listed}
     if outside:
         out["runs_outside_streams"] = outside

@@ -153,6 +153,48 @@ def noop_serve(command: str) -> bool:
     return head in ("echo", "true", ":") and not any(op in text for op in ("&&", "||", "|", "$("))
 
 
+# What a repository's own serve command and ready URL hold in place of an item's port (`serve` among its facts).
+PORT_SLOT = "{port}"
+# What can put a second command after a first: `noop_serve` reads `echo starting; exec npm run dev` as starting nothing.
+SEQUENCE_MARKS = (";", "&", "\n", "`", "$(")
+
+
+def starts_nothing(command: str) -> bool:
+    """A Serve line the repository's own serve command may stand in for: one `noop_serve` takes for a no-op, with
+    nothing after it that could start a server. `noop_serve` also takes `echo starting; exec npm run dev` for one, and
+    such a line is sent back after the build, as it always was; served in its place, the repository's command would be
+    served while the reviewer is told the build's own line starts nothing."""
+    return noop_serve(command) and not any(mark in command.strip().strip(";") for mark in SEQUENCE_MARKS)
+
+
+def default_serve_problems(serve) -> list[str]:
+    """Why a repository's `serve` fact cannot stand in for a build's Serve
+    and Ready lines: it is `{"command": ..., "ready": ...}`, one command
+    line that starts the server on `{port}` and an http URL on `{port}`
+    that answers once it is up."""
+    if not isinstance(serve, dict) or set(serve) != {"command", "ready"}:
+        return ["`serve` takes `command` and `ready`, and nothing else"]
+    problems = []
+    command, ready = serve["command"], serve["ready"]
+    if not isinstance(command, str) or PORT_SLOT not in command or "\n" in command or noop_serve(command.replace(PORT_SLOT, "8000")):
+        problems.append(f"`serve.command` must be one command line that starts the server on `{PORT_SLOT}`")
+    if not isinstance(ready, str) or not ready.startswith(("http://", "https://")) or PORT_SLOT not in ready or any(c.isspace() for c in ready):
+        problems.append(f"`serve.ready` must be a URL on `{PORT_SLOT}` that answers once the server is up")
+    return problems
+
+
+def serving(how: dict, look: bool, default: dict | None, port) -> dict:
+    """What is served for a build: its report's Serve and Ready lines, or,
+    for a build routed with a look whose Serve line starts nothing, the
+    repository's own serve command and ready URL on the item's port, with
+    `serve_default` set. Without the fact, or without a port, the report's
+    lines as they are."""
+    if not (look and default and starts_nothing(how["serve"]) and str(port or "").isdigit()):
+        return how
+    port = str(port)
+    return {"serve": default["command"].replace(PORT_SLOT, port), "ready_kind": "URL", "ready": default["ready"].replace(PORT_SLOT, port), "serve_default": True}
+
+
 def how_to_run(text: str) -> dict:
     """`**Serve.**` and `**Ready.**` from a build report, as the served-build
     script needs them. Exactly one of each, or a ContractError naming which."""

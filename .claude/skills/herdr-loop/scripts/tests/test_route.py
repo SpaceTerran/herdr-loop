@@ -134,10 +134,10 @@ class PolicyTest(RouteCase):
         items.init_run(other, "twice", "owner/repo", [str(self.file_r)], policy={"bounds": {"give_back": 2}})
         self.assertEqual(items.bounds(items.load_run(other))["give_back"], 2)
         # It is counted from the attempt log, so no item starts with a number for it.
-        self.assertEqual(sorted(items.load_attempts(other, "R-1")), ["agree", "build", "ci_rerun", "correction", "grade", "log", "verify"])
+        self.assertEqual(sorted(items.load_attempts(other, "R-1")), ["agree", "build", "ci_rerun", "correction", "grade", "log", "verify", "walk"])
         with self.assertRaises(Refusal) as caught:
             items.init_run(self.tmp / "never", "never", "owner/repo", [str(self.file_r)], policy={"bounds": {"give_back": 0}})
-        self.assertEqual(str(caught.exception), "bounds must be whole numbers of at least 1 for agree, build, grade, correction, ci_rerun, verify, give_back; got give_back=0")
+        self.assertEqual(str(caught.exception), "bounds must be whole numbers of at least 1 for agree, build, grade, correction, ci_rerun, verify, walk, give_back; got give_back=0")
 
     def test_a_policy_that_makes_no_sense_is_refused(self):
         for bad in ({"premise": "sometimes"}, {"review": "skim"}, {"bounds": {"build": 0}}, {"bounds": {"builds": 3}}, {"bounds": {"build": "3"}}, {"bounds": {"build": True}}):

@@ -369,10 +369,10 @@ class ExerciseTest(RunCase):
         self.assertEqual(self.pages([("mcp__playwright__browser_run_code", {"code": self.ELSEWHERE})]), (1, 1, 0))
 
     def test_a_browser_script_passed_as_a_file_is_read_for_the_page_it_opens(self):
-        # Found on HCO-34: the reviewer wrote its script to a file and passed the browser only the file's name.
+        # Found on HD-34: the reviewer wrote its script to a file and passed the browser only the file's name.
         written = ("Write", {"file_path": "/scratch/looks.js", "content": self.SCRIPT})
         self.assertEqual(self.pages([written, self.run_file("/scratch/looks.js")]), (1, 1, 1))
-        # Written by a here-document to a path in a variable, as on HCO-34.
+        # Written by a here-document to a path in a variable, as on HD-34.
         heredoc = bash(f"S=/scratch; cat > $S/looks.js <<EOF\n{self.SCRIPT}\nEOF")
         self.assertEqual(self.pages([heredoc, self.run_file("/scratch/looks.js")]), (1, 1, 1))
         self.assertEqual(self.pages([bash(f"tee /scratch/t.js >/dev/null <<'JS'\n{self.SCRIPT}\nJS"), self.run_file("/scratch/t.js")]), (1, 1, 1))
@@ -382,7 +382,7 @@ class ExerciseTest(RunCase):
         self.assertEqual(self.pages([self.run_file(str(on_disk), "browser_run_code")]), (1, 1, 1))
 
     def test_a_browser_script_copied_to_where_the_browser_may_read_it_is_followed(self):
-        # HCO-34, both reviews: the browser refused the scratch path, so the script was copied into the evidence
+        # HD-34, both reviews: the browser refused the scratch path, so the script was copied into the evidence
         # directory, run from there, and removed. The copy is gone from disk; the transcript shows what it held.
         made = bash(f"cd /ev; S=/scratch\ncat > $S/looks.js <<EOF\n{self.SCRIPT}\nEOF")
         copied = bash("cd /items/A-1/evidence-2; S=/scratch; mkdir -p .pw && cp $S/looks.js .pw/looks-run.js && ls")
@@ -629,6 +629,118 @@ class CheckTest(CheckCase):
         self.route(look=False)
         out = self.check([bash("curl -s http://127.0.0.1:8401/")])
         self.assertEqual((out["look_required"], out["looked"], out["problems"]), (False, False, []))
+
+
+COUNTS = {"cut": 0, "outside": 0, "overlap": 0, "hard_ellipsis": 0, "ellipsis": 0, "input_cut": 0, "short_wrap": 0, "hscroll": 0}
+RUNNER = "/loops/p/runs/r/items/A-1/evidence-1/.playwright-mcp/text-fit-run.js"
+
+
+def resize(width, height=800):
+    """`browser_resize`, and what the browser tool (@playwright/mcp 0.0.82) answers to it."""
+    return ("mcp__playwright__browser_resize", {"width": width, "height": height}, f"### Ran Playwright code\n```js\nawait page.setViewportSize({{ width: {width}, height: {height} }});\n```")
+
+
+def text_fit(width, pretty=False):
+    """The kit's runner, run from the file a brief names, and the check's answer as the browser tool prints it
+    (`browser_evaluate` prints it indented, `browser_run_code_unsafe` on one line)."""
+    answer = {"width": width, "counts": COUNTS, "cut": [], "outside": [], "overlap": [], "hard_ellipsis": [], "ellipsis": 0, "input_cut": [], "short_wrap": [], "hscroll": 0}
+    shown = json.dumps(answer, indent=2 if pretty else None, separators=None if pretty else (",", ":"))
+    return ("mcp__playwright__browser_run_code_unsafe", {"filename": RUNNER}, f"### Result\n{shown}\n### Ran Playwright code\n```js\nawait (async (page) => page.evaluate(\n() => {{ /* … */ }}\n))(page);\n```")
+
+
+class TextFitWidthTest(CheckCase):
+    """A review of an item a person looks at runs the kit's text-fit check at
+    the widths its brief asks for. On the help-desk catalog program (2026-11-18) the brief
+    asked for 1280, 1440 and the narrowest width, and HD-1048's review ran it at
+    1280 only, HD-1039's at 390 only, and both passed."""
+
+    PAGE = navigate("http://127.0.0.1:8401/app/alerts")
+
+    def setUp(self):
+        super().setUp()
+        self.route(look=True)
+        self.look(self.picture())
+        self.ask()
+
+    def ask(self, asked=True):
+        """The review's brief: since the kit has had the check, a look's brief names it."""
+        step = "pass the whole of `/kit/references/text-fit.js` as the `function` of `browser_evaluate`" if asked else "look at 1280×800"
+        (self.item_dir() / "grade-1.brief.md").write_text(f"# Review\n\n{step}\n")
+
+    def problems(self, calls):
+        return [p for p in self.check(calls)["problems"] if "text-fit" in p]
+
+    def test_the_check_at_each_width_the_brief_asks_for_counts(self):
+        out = self.check([self.PAGE, text_fit(1280), resize(1440, 900), text_fit(1440), resize(390, 844), text_fit(390, pretty=True)])
+        self.assertEqual((out["text_fit_widths"], out["problems"]), ([390, 1280, 1440], []))
+        # A page made without a phone layout is looked at at 1024 at its narrowest.
+        self.assertEqual(self.problems([self.PAGE, text_fit(1024), text_fit(1280), text_fit(1600)]), [])
+
+    def test_a_review_that_ran_the_check_at_one_width_does_not_count(self):
+        problems = self.problems([self.PAGE, text_fit(1280), resize(390, 844), resize(1440, 900)])
+        self.assertEqual(
+            problems,
+            [
+                "this item changes something a person looks at, and the review's text-fit check answered at 1280 px only, not at 1024 or narrower or at "
+                "1440 or wider: its brief asks for the check at 1280, at 1440 or wider and at 1024 or narrower"
+            ],
+        )
+        self.assertIn("answered at no width, not at 1024 or narrower or at 1280 or at 1440 or wider", self.problems([self.PAGE])[0])
+
+    def test_the_check_inside_a_reviewers_own_script_takes_the_viewports_width(self):
+        # HD-1037's reviewer kept the check as `window.__tf` and returned its counts beside measures of its own, as a JSON string.
+        def own(width_key):
+            shown = json.dumps(json.dumps({width_key: 0, "room": 303, "fits": True, "counts": COUNTS}, separators=(",", ":")))
+            return ("mcp__playwright__browser_evaluate", {"function": "() => JSON.stringify({ ...measure(), counts: window.__tf().counts })"}, f"### Result\n{shown}\n### Ran Playwright code\n```js\nawait page.evaluate('…');\n```")
+
+        out = self.check([self.PAGE, own("vw"), resize(390, 844), own("vw"), resize(1440, 900), own("vw")])
+        # Each session's browser starts at 1280 (`references/mcp-playwright.json`).
+        self.assertEqual((out["text_fit_widths"], out["problems"]), ([390, 1280, 1440], []))
+        # HD-1046's returned the counts alone, `JSON.stringify(window.__tf().counts)`.
+        bare = ("mcp__playwright__browser_evaluate", {"function": "() => JSON.stringify(window.__tf().counts)"}, f"### Result\n{json.dumps(json.dumps(COUNTS))}\n")
+        self.assertEqual(self.check([self.PAGE, bare, resize(1440, 900), bare, resize(390, 844), bare])["text_fit_widths"], [390, 1280, 1440])
+
+    def test_a_viewport_set_in_a_script_is_the_width_of_what_it_measures(self):
+        def script(code):
+            # The browser tool prints the answer, then the code it ran.
+            shown = f'### Result\n{{"counts": {json.dumps(COUNTS)}}}\n### Ran Playwright code\n```js\nawait ({code})(page);\n```'
+            return ("mcp__playwright__browser_run_code_unsafe", {"code": code}, shown)
+
+        narrow = script("async (page) => { await page.setViewportSize({ width: 390, height: 844 }); return { counts: (await page.evaluate(check)).counts }; }")
+        here = script("async (page) => ({ counts: (await page.evaluate(check)).counts })")
+        out = self.check([self.PAGE, here, narrow, resize(1440, 900), here])
+        self.assertEqual(out["text_fit_widths"], [390, 1280, 1440])
+
+    def test_a_check_that_failed_or_ran_from_the_shell_answered_nothing(self):
+        failed = ("mcp__playwright__browser_run_code_unsafe", {"filename": RUNNER}, "### Error\nError: File access denied: /tmp/x/text-fit-run.js is outside allowed roots.")
+        answer = json.dumps({"width": 390, "counts": COUNTS})
+        shell = bash("node /tmp/tf.mjs http://127.0.0.1:8401/app/alerts 390", answer)
+        out = self.check([self.PAGE, text_fit(1280), text_fit(1440), failed, shell])
+        self.assertEqual(out["text_fit_widths"], [1280, 1440])
+        self.assertEqual(len([p for p in out["problems"] if "text-fit" in p]), 1)
+
+    def test_a_brief_that_never_asked_for_the_check_is_not_held_to_it(self):
+        # A review rendered before the kit had the check, and passed then, still merges.
+        self.ask(False)
+        self.assertEqual(self.problems([self.PAGE, text_fit(1280)]), [])
+
+    def test_an_item_nobody_looks_at_is_not_held_to_it(self):
+        item = items.load_item(self.run_dir, "A-1")
+        item["route"] = {**item["route"], "look": False}
+        items.save_item(self.run_dir, item)
+        self.look()
+        self.assertEqual(self.problems([bash("curl -s http://127.0.0.1:8401/")]), [])
+
+    def test_the_answer_this_reads_is_the_one_the_kits_check_gives(self):
+        # The check's own last line, and the order of the kinds its counts name: what `TEXT_FIT_COUNTS_RE` reads.
+        source = (Path(review.__file__).parents[2] / "references" / "text-fit.js").read_text()
+        self.assertIn("return { width: window.innerWidth, counts, ...res };", source)
+        kinds = re.search(r"const res = \{([^}]*)\};", source).group(1)
+        self.assertLess(kinds.index("hard_ellipsis"), kinds.index("short_wrap"))
+        # The viewport every session starts at.
+        config = json.loads((Path(review.__file__).parents[2] / "references" / "mcp-playwright.json").read_text())
+        args = config["mcpServers"]["playwright"]["args"]
+        self.assertEqual(args[args.index("--viewport-size") + 1].split("x")[0], str(review.VIEWPORT_WIDTH))
 
 
 class DiffFactsTest(RunCase):

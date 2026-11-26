@@ -617,7 +617,7 @@ class TranscriptLookupTest(WaitCase):
         return path
 
     def test_a_transcript_on_another_sign_in_beside_the_default_is_found(self):
-        path = self.write_in(self.home / ".claude-team")
+        path = self.write_in(self.home / ".claude-loop")
         self.assertEqual(herdr.claude_transcript(SESSION), path)
         # The default is still read, for sessions on either side of a program's move.
         other = "11111111-1111-1111-1111-111111111111"
@@ -633,7 +633,7 @@ class TranscriptLookupTest(WaitCase):
             self.assertEqual(herdr.claude_homes()[:2], [elsewhere, self.home / ".claude"])
 
     def test_a_sub_agents_transcript_is_found_beside_its_session_on_another_sign_in(self):
-        main = self.write_in(self.home / ".claude-team")
+        main = self.write_in(self.home / ".claude-loop")
         sub = main.parent / SESSION / "subagents" / "agent-a1.jsonl"
         sub.parent.mkdir(parents=True)
         sub.write_text("{}\n")

@@ -1640,6 +1640,11 @@ class EnvTest(SecretsCase):
         self.assertEqual(out, ["hl-env ok ab12cd34-ready", "rc=0", "claude= gh=set api= memory=1", "gh-is-the-kept-one", "left="])
         self.assertEqual(self.reads(), [GH_REF])
 
+    def test_a_page_walk_gets_no_github_token_and_the_keeper_is_not_asked_for_one(self):
+        out = self.source(CLAUDE_REF, "-", "ab12cd34", str(self.root), before="export GH_TOKEN=keyring-admin")
+        self.assertEqual(out, ["hl-env ok ab12cd34-ready", "rc=0", "claude=set gh= api= memory=1", "claude-is-the-kept-one", "left="])
+        self.assertEqual(self.reads(), [CLAUDE_REF])
+
     def test_a_claude_worker_of_a_program_on_the_signed_in_account_gets_only_the_github_token(self):
         self.settings(worker_claude_ref="-")
         out = self.source("-", GH_REF, "ab12cd34", str(self.root))
@@ -1707,11 +1712,17 @@ class EnvTest(SecretsCase):
         out = self.source(CLAUDE_REF, GH_REF, "ab12cd34", str(self.root), before="setopt nounset")
         self.assertEqual(out[:2], ["hl-env ok ab12cd34-ready", "rc=0"])
         out = self.source(before="setopt nounset")
-        self.assertEqual(out[:2], ["hl-env FAILED: usage: hl-env.sh <claude-ref|-> <gh-ref> <nonce> [<loop root>]", "rc=1"])
+        self.assertEqual(out[:2], ["hl-env FAILED: usage: hl-env.sh <claude-ref|-> <gh-ref|-> <nonce> [<loop root>]", "rc=1"])
+        # A page walk's pane, which is given no GitHub token, in such a shell.
+        out = self.source(CLAUDE_REF, "-", "ab12cd34", str(self.root), before="setopt nounset")
+        self.assertEqual(out[:3], ["hl-env ok ab12cd34-ready", "rc=0", "claude=set gh= api= memory=1"])
 
     def test_a_shell_that_exits_on_a_failure_still_prints_the_line_the_spawn_waits_for(self):
         out = self.source(CLAUDE_REF, GH_REF, "ab12cd34", str(self.root), before="set -e")
         self.assertEqual(out[:2], ["hl-env ok ab12cd34-ready", "rc=0"])
+        # With no GitHub token to export (a page walk), the test that skips it does not end the shell.
+        out = self.source(CLAUDE_REF, "-", "ab12cd34", str(self.root), before="set -e")
+        self.assertEqual(out[:3], ["hl-env ok ab12cd34-ready", "rc=0", "claude=set gh= api= memory=1"])
         self.cli("forget")
         self.set("mode", "fail")
         # The failed read is where such a shell stops; the line it leaves is the one that says why.

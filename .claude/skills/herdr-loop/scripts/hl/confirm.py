@@ -38,6 +38,14 @@ Both ask the same questions (`chain`):
                            no path a person sees unless the failed review
                            looked and that path was in the diff it was given
 
+A fix for red checks (a run that is also `confirm_red_checks: delta`): the
+review before it passed, and the pull request's required checks then came
+out red on the very commit it passed, as `hl-wait --checks` recorded them
+(`items.red_checks_record`). The confirm answers those checks, entry by
+entry, in place of a fix list, and everything else above is asked of it the
+same way. The checks themselves run again on the new head, and nothing
+merges until they are green.
+
 One confirm for an item: when it fails, the next rework gets a full review,
 and so does the head of a confirm that was given back after it passed over
 a changed checkout.
@@ -77,8 +85,41 @@ def confirms_had(run_dir, item_id: str) -> list[dict]:
     return [e for e in reviews(run_dir, item_id) + items.given_back(attempts) if e.get("kind") == items.CONFIRM]
 
 
-def _failed_review(run_dir, item_id: str, first: dict) -> tuple[list[str], dict]:
-    """Why review `first` cannot be what a delta confirm builds on, and what a confirm takes from it."""
+def red_checks(run_dir, item_id: str, first: dict) -> tuple[list[str], dict]:
+    """Why no required check is on record as red on the commit review
+    `first` passed, or the record: what a confirm of a fix for red checks
+    answers, one entry for each check, in the order it was written."""
+    d = items.item_dir(run_dir, item_id)
+    said = f"review {first['n']}"
+    path = items.red_checks_record(d, first["build"])
+    if not path.is_file():
+        return [f"{said} passed, and no required check is on record as red on the commit it was of ({path.name}, which `hl-wait --checks` writes)"], {}
+    try:
+        record = read_json(path)
+        red = record["red"]
+        names = [check["name"] for check in red]
+    except (OSError, ValueError, KeyError, TypeError) as failure:
+        return [f"{path.name}, the record of the checks that came out red after {said} passed, cannot be read ({failure})"], {}
+    built = next(
+        (e for e in reversed(items.load_attempts(run_dir, item_id)["log"]) if e["phase"] == "build" and e.get("n") == first["build"] and not e.get("voided")),
+        {},
+    )
+    if built.get("red_checks_sha") != items.red_checks_digest(record):
+        # The file lies where the rework's builder writes with its permission checks off; the attempt log is the script's.
+        return [f"{path.name} is not the record `hl-wait --checks` wrote of build {first['build']}'s checks: it was written or changed by something else"], {}
+    if record.get("head_sha") != first.get("head_sha"):
+        # Red on another commit: the checks of the commit that passed may have been green, and what changed since is not their fix.
+        return [f"the checks in {path.name} came out red on {str(record.get('head_sha'))[:12]}, not on {str(first.get('head_sha'))[:12]}, the commit {said} passed"], {}
+    if not names or not all(isinstance(name, str) and name.strip() for name in names):
+        return [f"{path.name} names no required check that came out red after {said} passed"], {}
+    # The same checks in words, with the command that prints each failed run's log: what the builder was pointed at.
+    return [], {"record": record, "checks_sha": items.red_checks_digest(record), "checks_file": str(path.with_suffix(".md"))}
+
+
+def _failed_review(run_dir, item_id: str, first: dict, red: bool = False) -> tuple[list[str], dict]:
+    """Why review `first` cannot be what a delta confirm builds on, and what
+    a confirm takes from it. `red`: a pass followed by red checks may also
+    be built on, in a run that gives a fix for red checks a confirm."""
     d = items.item_dir(run_dir, item_id)
     n = first["n"]
     said = f"review {n}"
@@ -89,12 +130,17 @@ def _failed_review(run_dir, item_id: str, first: dict) -> tuple[list[str], dict]
     checked = verdict.check(d, n, style="code")
     if checked["problems"]:
         return [f"{said} left no usable verdict ({checked['problems'][0]})"], {}
-    if checked["effective"] != "FAIL":
+    checks: dict = {}
+    if checked["effective"] == "PASS" and red:
+        problems, checks = red_checks(run_dir, item_id, first)
+        if problems:
+            return problems, {}
+    elif checked["effective"] != "FAIL":
         return [f"{said} is {checked['effective']}, not a fail with a fix list"], {}
     data = read_json(d / f"verdict-{n}.json")
     fixes = data["fix_list"]
     problems = []
-    if not fixes:
+    if not fixes and not checks:
         problems.append(f"{said} failed without a fix list")
     unchecked = sorted(c["n"] for c in data["criteria"] if c["result"] == "not_checked")
     if unchecked:
@@ -115,20 +161,27 @@ def _failed_review(run_dir, item_id: str, first: dict) -> tuple[list[str], dict]
     contract = d / "contract.md"
     if not contract.exists() or sha256_text(contract.read_text()) != first.get("contract_sha"):
         problems.append(f"the contract changed after {said}")
-    return problems, {"verdict": data, "fixes": fixes, "looks": review.recorded_looks(d, n), "looked": bool((read or {}).get("looked"))}
+    found = {"verdict": data, "fixes": fixes, "looks": review.recorded_looks(d, n), "looked": bool((read or {}).get("looked"))}
+    if checks:
+        # What the confirm answers is the checks that came out red, not the passed review's fix list, which is empty.
+        found.update(red_checks=checks["record"]["red"], checks_sha=checks["checks_sha"], checks_file=checks["checks_file"])
+    return problems, found
 
 
-def chain(run_dir, item_id: str, first: dict, head: str, tools, checkout, base_ref: str | None, repo_facts: dict, bound: dict, how_run: str | None) -> tuple[list[str], dict]:
+def chain(
+    run_dir, item_id: str, first: dict, head: str, tools, checkout, base_ref: str | None, repo_facts: dict, bound: dict, how_run: str | None, red: bool = False
+) -> tuple[list[str], dict]:
     """Why a confirm of the change from the commit review `first` was of to
     `head` may not stand in for a full review of `head`; nothing when it
     may. `base_ref` is the branch the pull request goes into, as the clone
     has it (its repository's train, for a run on one), or None for a pull
-    request that has already merged, whose base has taken it in."""
+    request that has already merged, whose base has taken it in. `red`: a
+    review that passed, followed by red checks, may be built on too."""
     d = items.item_dir(run_dir, item_id)
     n = first["n"]
     said = f"review {n}"
     start = first.get("head_sha") or ""
-    problems, found = _failed_review(run_dir, item_id, first)
+    problems, found = _failed_review(run_dir, item_id, first, red)
     if problems:
         return problems, found
     if head == start:
@@ -206,13 +259,18 @@ def decide(run_dir, item_id: str, head: str, tools, checkout, base_ref: str, rep
         why = f"review {spent[0]['n']}{back} was this item's one delta confirm"
     else:
         first = done[-1]
-        problems, found = chain(run_dir, item_id, first, head, tools, checkout, base_ref, repo_facts or {}, items.policy(run)["confirm_bound"], how_run)
+        red = items.red_checks_confirmed(run)
+        problems, found = chain(run_dir, item_id, first, head, tools, checkout, base_ref, repo_facts or {}, items.policy(run)["confirm_bound"], how_run, red)
         if not problems:
-            return {
+            if "red_checks" in found:
+                names = ", ".join(f"`{check['name']}`" for check in found["red_checks"])
+                before = f"review {first['n']} passed at {first['head_sha'][:12]} and required checks then came out red on it ({names})"
+            else:
+                before = f"review {first['n']} failed at {first['head_sha'][:12]} with {_count(len(found['fixes']), 'fix-list entry', 'fix-list entries')}"
+            plan = {
                 "kind": "delta",
                 "why": (
-                    f"review {first['n']} failed at {first['head_sha'][:12]} with {_count(len(found['fixes']), 'fix-list entry', 'fix-list entries')}, and the fix "
-                    f"since is {_count(found['lines'], 'changed line', 'changed lines')} in {_count(len(found['fix']['files']), 'file', 'files')} "
+                    f"{before}, and the fix since is {_count(found['lines'], 'changed line', 'changed lines')} in {_count(len(found['fix']['files']), 'file', 'files')} "
                     f"(a confirm may cover {found['allowed']})"
                 ),
                 "confirms": first["n"],
@@ -223,6 +281,9 @@ def decide(run_dir, item_id: str, head: str, tools, checkout, base_ref: str, rep
                 "looks": found["looks"],
                 "facts": found["fix"],
             }
+            if "red_checks" in found:
+                plan.update(red_checks=found["red_checks"], checks_sha=found["checks_sha"], checks_file=found["checks_file"])
+            return plan
         why = "; ".join(problems)
     return {"kind": "full", "why": why}
 
@@ -237,6 +298,9 @@ def chain_problems(run_dir, item_id: str, entry: dict, tools, checkout, base_ref
     in_full = f"; review the head in full (`hl-flow review --id {item_id} --full`)"
     if items.policy(run)["confirm"] != "delta" or items.policy(run)["review"] != "code":
         return [f"review {n} is recorded as a delta confirm, and this run confirms a rework with a full review{in_full}"]
+    red = entry.get("red_checks") is not None
+    if red and not items.red_checks_confirmed(run):
+        return [f"review {n} is recorded as a delta confirm of a fix for red checks, and this run gives such a fix a full review{in_full}"]
     done = reviews(run_dir, item_id)
     earlier = [e for e in done if e["n"] < n]
     first = earlier[-1] if earlier else None
@@ -251,5 +315,10 @@ def chain_problems(run_dir, item_id: str, entry: dict, tools, checkout, base_ref
         problems.append(f"review {first['n']} and its confirm must be two sessions, neither of them a builder's{in_full}")
     if repo_facts is None:
         return problems + [f"the program of {run['run_id']} was not found, so the paths a person sees and those no item may change are unknown: pass --root"]
-    found, _ = chain(run_dir, item_id, first, entry["head_sha"], tools, checkout, base_ref, repo_facts, items.policy(run)["confirm_bound"], entry.get("how_run"))
+    found, facts = chain(run_dir, item_id, first, entry["head_sha"], tools, checkout, base_ref, repo_facts, items.policy(run)["confirm_bound"], entry.get("how_run"), red)
+    if not found and red and "red_checks" not in facts:
+        # It answers the checks after a pass, and the review before it failed: what a builder must fix is that review's fix list.
+        found = [f"it answers red checks, and review {first['n']} is a fail with a fix list"]
+    elif not found and red and (facts["checks_sha"] != entry.get("checks_sha") or facts["red_checks"] != entry["red_checks"]):
+        found = [f"{items.red_checks_record(items.item_dir(run_dir, item_id), first['build']).name}, the checks it answers, changed after it started"]
     return problems + [f"review {n} is a delta confirm that cannot stand in for a full review: {problem}{in_full}" for problem in found]

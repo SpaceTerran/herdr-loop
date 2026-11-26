@@ -220,17 +220,68 @@ class PolicyStageTest(StageCase):
         policy = items.policy(items.load_run(self.root / "runs" / "portal-1"))
         self.assertEqual((policy["confirm"], policy["confirm_bound"]), ("delta", {"share": 0.25, "lines": 60, "files": 2}))
         self.assertEqual(program.load(self.root)["confirm"], "delta")
+        self.assertFalse(items.red_checks_confirmed(items.load_run(self.root / "runs" / "portal-1")))
+
+    def test_a_spec_can_give_a_fix_for_red_checks_the_same_confirm(self):
+        self.spec["settings"].update(review="code", confirm="delta", confirm_red_checks="delta")
+        self.write_spec()
+        self.stage()
+        self.assertTrue(items.red_checks_confirmed(items.load_run(self.root / "runs" / "portal-1")))
+        self.assertEqual(program.load(self.root)["confirm_red_checks"], "delta")
 
     def test_a_confirm_setting_that_cannot_work_stops_the_stage_before_anything_is_made(self):
         for settings, why in (
             ({"confirm": "delta", "review": "blind"}, "settings: a delta confirm of a rework needs reviews that read the code and write a fix list (`review: code`)"),
             ({"confirm": "quick"}, "settings: confirm 'quick' is not one of full, delta"),
             ({"confirm": "delta", "confirm_bound": {"share": 2}}, "settings: `confirm_bound` takes `share` (above 0, at most 1)"),
+            ({"confirm": "full", "confirm_red_checks": "delta"}, "settings: a delta confirm of a fix for red checks extends the delta confirm of a rework: it needs `confirm: delta`"),
+            ({"confirm": "delta", "confirm_red_checks": "often"}, "settings: confirm_red_checks 'often' is not one of full, delta"),
         ):
             self.spec["settings"] = {**self.spec["settings"], "review": "code", "confirm_bound": {}, **settings}
             self.write_spec()
             self.assertIn(why, "; ".join(self.refusal()), settings)
             self.assertFalse((self.root / "program.json").exists())
+
+    def test_a_spec_can_loosen_the_two_review_rules_for_its_runs(self):
+        self.spec["settings"].update(write_list="note", text_fit_widths="recorded")
+        self.spec["repos"] = {"owner/desk": {"text_fit_check": "full-ci / text-fit"}}
+        self.write_spec()
+        self.stage()
+        run = items.load_run(self.root / "runs" / "portal-1")
+        self.assertEqual(items.options_on(run), {"write_list": "note", "text_fit_widths": "recorded"})
+        self.assertEqual((program.load(self.root)["write_list"], program.load(self.root)["text_fit_widths"]), ("note", "recorded"))
+
+    def test_recorded_widths_need_the_repositorys_own_text_fit_check(self):
+        # The widths a review skipped count only where the repository's required check measures them; a spec that
+        # names none would leave 1440 and the narrow width checked by nothing (the fresh review of change 3).
+        self.spec["settings"].update(text_fit_widths="recorded")
+        self.write_spec()
+        self.assertIn("settings: `text_fit_widths: recorded` leaves the widths to the repository's own required text-fit check, and repos[owner/desk] names none", "; ".join(self.refusal()))
+        self.assertFalse((self.root / "program.json").exists())
+        self.spec["repos"] = {"owner/desk": {"text_fit_check": " "}}
+        self.write_spec()
+        self.assertIn("repos[owner/desk]: `text_fit_check` must be the name of one required check", "; ".join(self.refusal()))
+
+    def test_a_review_rule_setting_outside_its_two_values_stops_the_stage(self):
+        for key, bad, why in (
+            ("write_list", "ignore", "settings: `write_list` is one of criterion, note, got 'ignore'"),
+            ("text_fit_widths", "none", "settings: `text_fit_widths` is one of counted, recorded, got 'none'"),
+        ):
+            self.spec["settings"] = {**self.spec["settings"], key: bad}
+            self.write_spec()
+            self.assertIn(why, "; ".join(self.refusal()), key)
+            self.assertFalse((self.root / "program.json").exists())
+            del self.spec["settings"][key]
+
+    def test_a_build_context_cap_reaches_program_json_and_one_claude_code_would_refuse_stops_the_stage(self):
+        self.spec["settings"]["builder_autocompact"] = "150k"
+        self.write_spec()
+        self.stage()
+        self.assertEqual(program.load(self.root)["builder_autocompact"], "150k")
+        for bad in ("99k", "150000", "1m", 150):
+            self.spec["settings"]["builder_autocompact"] = bad
+            self.write_spec()
+            self.assertIn(f"settings: `builder_autocompact` is a size from 100k to 999k, such as `150k`, or null, got {bad!r}", "; ".join(self.refusal()), bad)
 
     def test_a_policy_that_makes_no_sense_stops_the_stage(self):
         self.spec["settings"]["premise"] = "sometimes"
@@ -266,6 +317,23 @@ class SpecFactsTest(StageCase):
         # The manager's launch line comes with the settings: only the tools it uses, none of the host's servers or skills.
         self.assertEqual(cfg["manager_args"][:2], ["--tools", "Bash,Read,Edit,Write,Agent,TaskStop"])
         self.assertIn("--strict-mcp-config", cfg["manager_args"])
+
+    def test_a_repository_merges_through_its_queue_only_where_the_spec_says_true(self):
+        self.spec["repos"] = {"owner/desk": {"merge_queue": True}}
+        self.write_spec()
+        self.stage()
+        self.assertIs(program.load(self.root)["repos"]["owner/desk"]["merge_queue"], True)
+
+    def test_a_merge_queue_fact_other_than_true_or_beside_a_train_stops_the_stage(self):
+        for facts, why in (
+            ({"merge_queue": False}, "repos[owner/desk]: `merge_queue` is `true` (the base's merge queue makes every merge) or left out, got False"),
+            ({"merge_queue": "true"}, "repos[owner/desk]: `merge_queue` is `true` (the base's merge queue makes every merge) or left out, got 'true'"),
+            ({"merge_queue": True, "train": {}}, "repos[owner/desk]: `merge_queue` with `train`"),
+        ):
+            self.spec["repos"] = {"owner/desk": facts}
+            self.write_spec()
+            self.assertIn(why, "; ".join(self.refusal()), facts)
+            self.assertFalse((self.root / "program.json").exists())
 
     def test_remarks_on_the_accept_lists_come_back_with_the_stage_and_stop_nothing(self):
         out = self.stage()
@@ -400,6 +468,27 @@ class SpecFactsTest(StageCase):
         self.write_spec()
         self.stage()
         self.assertEqual(program.load(self.root)["repos"]["owner/desk"]["rewrites"], ["next-env.d.ts", "src/generated/", "*.lock"])
+
+    def test_a_serve_command_starts_a_server_on_the_port_and_reaches_the_settings(self):
+        command, ready = "sh services/desk/run-dev.sh {port}", "http://127.0.0.1:{port}/healthz"
+        for bad, why in (
+            ("sh run.sh {port}", "`serve` takes `command` and `ready`, and nothing else"),
+            ({"command": command}, "`serve` takes `command` and `ready`, and nothing else"),
+            ({"command": command, "ready": ready, "port": 1}, "`serve` takes `command` and `ready`, and nothing else"),
+            ({"command": "sh services/desk/run-dev.sh 8000", "ready": ready}, "`serve.command` must be one command line that starts the server on `{port}`"),
+            ({"command": "true {port}", "ready": ready}, "`serve.command` must be one command line that starts the server on `{port}`"),
+            ({"command": "a {port}\nb", "ready": ready}, "`serve.command` must be one command line that starts the server on `{port}`"),
+            ({"command": command, "ready": "curl -s http://127.0.0.1:{port}/"}, "`serve.ready` must be a URL on `{port}` that answers once the server is up"),
+            ({"command": command, "ready": "http://127.0.0.1:8000/"}, "`serve.ready` must be a URL on `{port}` that answers once the server is up"),
+        ):
+            self.spec["repos"] = {"owner/desk": {"serve": bad}}
+            self.write_spec()
+            self.assertIn(f"repos[owner/desk]: {why}", " | ".join(self.refusal()), bad)
+            self.assertFalse((self.root / "program.json").exists())
+        self.spec["repos"] = {"owner/desk": {"serve": {"command": command, "ready": ready}}}
+        self.write_spec()
+        self.stage()
+        self.assertEqual(program.load(self.root)["repos"]["owner/desk"]["serve"], {"command": command, "ready": ready})
 
     def test_a_reference_directory_is_one_relative_directory_and_reaches_the_settings(self):
         for bad in ("", "/", "/abs/brand", "brand/*", "../brand", "brand/../x", ["brand"], 3):
@@ -717,12 +806,12 @@ class ClaudeHomeStageTest(StageCase):
         self.write_spec()
 
     def test_a_signed_in_directory_beside_the_default_is_staged_and_named_in_the_prompt(self):
-        team = str(self.home / ".claude-team")
-        self.with_home(team)
+        loop_home = str(self.home / ".claude-loop")
+        self.with_home(loop_home)
         self.stage()
-        self.assertEqual(read_json(self.root / "program.json")["claude_config_dir"], team)
+        self.assertEqual(read_json(self.root / "program.json")["claude_config_dir"], loop_home)
         prompt = (self.root / "MANAGER-PROMPT.md").read_text()
-        self.assertIn(f"are on the sign-in in `{team}`", prompt)
+        self.assertIn(f"are on the sign-in in `{loop_home}`", prompt)
         self.assertNotIn("{{CLAUDE_ACCOUNT}}", prompt)
 
     def test_without_the_setting_the_program_starts_on_its_first_seat_and_the_prompt_names_every_seat(self):
@@ -788,14 +877,14 @@ class ClaudeHomeStageTest(StageCase):
             self.assertTrue(any("`seat_full_percent` must be a number from 50 to 100" in r for r in reasons), (value, reasons))
 
     def test_a_directory_with_no_sign_in_is_refused_before_anything_is_staged(self):
-        self.with_home(str(self.home / ".claude-team"), signed_in=False)
-        (self.home / ".claude-team").mkdir()
+        self.with_home(str(self.home / ".claude-loop"), signed_in=False)
+        (self.home / ".claude-loop").mkdir()
         reasons = self.refusal()
         self.assertTrue(any("holds no Claude sign-in" in r for r in reasons), reasons)
         self.assertFalse((self.root / "program.json").exists())
 
     def test_a_directory_anywhere_else_is_refused(self):
-        for value in (str(self.tmp / "elsewhere" / ".claude-team"), str(self.home / ".claude"), str(self.home / "claude-team"), "relative/.claude-team"):
+        for value in (str(self.tmp / "elsewhere" / ".claude-loop"), str(self.home / ".claude"), str(self.home / "claude-loop"), "relative/.claude-loop"):
             # Nothing is made on disk for these: the shape is refused before any sign-in is looked for.
             self.with_home(value, signed_in=False)
             reasons = self.refusal()

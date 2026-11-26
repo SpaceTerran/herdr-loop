@@ -32,7 +32,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import backlog, clocks, items, outside, program, review
+from . import backlog, clocks, contractfmt, items, outside, program, review
 from .common import Refusal, emit, read_json, utc_now, write_json
 
 EXCLUDES = (".worktrees/", ".playwright-mcp/", ".scratch/")
@@ -113,7 +113,7 @@ def clock_remarks(spec: dict, task_dir: Path) -> list[str]:
 #                 merge deploys nothing: an outside pull request's deploy check (`hl-verify --outside`) reads their runs
 #                 on its merge commit. Left out, no outside pull request merges there: its deploy could not be checked
 REPO_FACT_LISTS = ("facts", "setup_inputs", "ci_covers", "not_in_ci", "seen", "protected", "rewrites", "item_checks", "exemptable", "deploys")
-REPO_FACT_KEYS = ("setup", "train", "reference") + REPO_FACT_LISTS
+REPO_FACT_KEYS = ("setup", "train", "reference", "serve", "text_fit_check", "merge_queue") + REPO_FACT_LISTS
 # Paths no repository has: a `rewrites` pattern that covers all three covers every path.
 ANY_PATH = ("zq9k", "zq9k/zq9k.zq9k", ".zq9k/zq9k")
 PLACEHOLDER_RE = re.compile(r"\{\{([A-Z_]+)\}\}")
@@ -163,6 +163,9 @@ def load_spec(path) -> dict:
     home_problem = program.claude_home_problem(settings.get("claude_config_dir"))
     if home_problem:
         problems.append(f"settings: {home_problem}")
+    compact_problem = program.autocompact_problem(settings.get("builder_autocompact"))
+    if compact_problem:
+        problems.append(f"settings: {compact_problem}")
     for adopt_problem in (
         outside.setting_problem(settings.get(outside.SETTING)),
         outside.vetters_problem(settings.get(outside.VETTERS)),
@@ -170,17 +173,29 @@ def load_spec(path) -> dict:
     ):
         if adopt_problem:
             problems.append(f"settings: {adopt_problem}")
-    if "confirm" in settings or "confirm_bound" in settings:
+    if "confirm" in settings or "confirm_bound" in settings or "confirm_red_checks" in settings:
         try:
             # Said here, before anything is staged, and not when the first run is made.
-            items.check_policy({key: settings.get(key, default) for key, default in (("review", "code"), ("confirm", "full"), ("confirm_bound", None))})
+            given = (("review", "code"), ("confirm", "full"), ("confirm_bound", None), ("confirm_red_checks", "full"))
+            items.check_policy({key: settings.get(key, default) for key, default in given})
         except Refusal as refusal:
             problems += [f"settings: {reason}" for reason in refusal.reasons]
+    for key, values in (*items.OPTIONS.items(), ("closing_audit", program.CLOSING_AUDITS), ("wait_delivery", program.WAIT_DELIVERIES)):
+        if key in settings and settings[key] not in values:
+            problems.append(f"settings: `{key}` is one of {', '.join(values)}, got {settings[key]!r}")
     repos = spec.get("repos") or {}
     named = {s.get("repo") or spec.get("repo") for s in spec["streams"]}
     if not isinstance(repos, dict):
         problems.append("`repos` must map a repository to its facts")
         repos = {}
+    if settings.get("text_fit_widths") == "recorded":
+        # The widths a review skipped count only where the repository's own required check measures them; `hl-merge`
+        # holds that check among the ones it holds green.
+        for repo in sorted(str(n) for n in named if not (repos.get(n) or {}).get("text_fit_check")):
+            problems.append(
+                f"settings: `text_fit_widths: recorded` leaves the widths to the repository's own required text-fit check, "
+                f"and repos[{repo}] names none (`text_fit_check`, the check's name)"
+            )
     for repo, facts in repos.items():
         if repo not in named:
             problems.append(f"repos: {repo!r} is not the repository of any stream ({', '.join(sorted(str(n) for n in named))})")
@@ -205,6 +220,15 @@ def load_spec(path) -> dict:
             parts = ref.strip("/").split("/") if isinstance(ref, str) else []
             if not isinstance(ref, str) or not ref.strip("/ ") or ref.startswith("/") or any(p in ("", ".", "..") for p in parts) or set("*?[]{}") & set(ref):
                 problems.append(f"repos[{repo}]: `reference` must be one directory of the repository, as a relative path (`brand`), got {ref!r}")
+        if "serve" in facts:
+            problems += [f"repos[{repo}]: {problem}" for problem in contractfmt.default_serve_problems(facts["serve"])]
+        if "text_fit_check" in facts and (not isinstance(facts["text_fit_check"], str) or not facts["text_fit_check"].strip()):
+            problems.append(f"repos[{repo}]: `text_fit_check` must be the name of one required check")
+        if "merge_queue" in facts and facts["merge_queue"] is not True:
+            # Left out is a merge as it always was; there is no third word for it.
+            problems.append(f"repos[{repo}]: `merge_queue` is `true` (the base's merge queue makes every merge) or left out, got {facts['merge_queue']!r}")
+        elif facts.get("merge_queue") and "train" in facts:
+            problems.append(f"repos[{repo}]: `merge_queue` with `train`: a train's items merge into its own branch, which has no queue, and a batch is promoted by `hl-train`")
         for pattern in facts.get("rewrites") if isinstance(facts.get("rewrites"), list) else []:
             # A pattern that covers any path at all would let a review start over whatever its build wrote.
             if isinstance(pattern, str) and review.matching(list(ANY_PATH), [pattern]) == list(ANY_PATH):
@@ -277,6 +301,78 @@ def _clone(spec: dict, stream: dict, root: Path, kit: Path, base: str) -> dict:
     shutil.copyfile(kit / "scripts" / "hooks" / "commit-msg", hook)
     hook.chmod(0o755)
     return {"stream": stream["name"], "repo": repo, "clone": str(clone), "head": git(clone, "rev-parse", "--short", "HEAD")}
+
+
+# What the closing audit's first step adds with `closing_audit: pages`: a walk of the file's pages by a worker of the
+# kit's (`hl-spawn start --phase walk`), in a tab of its own, so that a hand-over of the manager does not end it.
+PAGE_WALK = (
+    " With `closing_audit: pages` the pages the file changed are walked as well, as a person meets them, by a worker"
+    " with a browser. Start it as soon as the file completes: `hl-spawn --root {{ROOT}} --run-dir <run> start --id"
+    " <the file's last merged item> --phase walk --engine claude --note-file <a file under the task folder that lists"
+    " the pages the file's items changed, a line each, with what a person does there>` (when it is another item, the"
+    " refusal names it). The kit checks it out at the commit that holds the whole file (on a train, once its batch is"
+    " promoted), with the repository's setup, serve command and facts, and keeps its browser to what it serves on this"
+    " host. Watch it as any worker (`hl-wait --for <ID>:walk-<n>`), and write the contract audit's repairs without"
+    " waiting for it. Once it is done, read `walk-<n>.md` in the item's directory, close it (`hl-spawn close`), and"
+    " place its defects as you place the audit's findings, as one more file and one more run, each repair item with"
+    " `**Origin.** audit: the page walk of <file>`, so that `velocity.origins` counts them (`found_per_100_merged`). A"
+    " walk that is done with no `walk-<n>.md` did not walk (`walk-<n>.no-browser` beside it: it had no browser): close"
+    " it, give it back (`hl-items --run-dir <run> void --id <ID> --phase walk --n <n> --note \"<why>\"`) and start it"
+    " once more; if that one ends the same way, write in the ledger that the file's pages were not walked, and why. It"
+    " runs in a tab of its own and outlives a hand-over: write it in \"Now\", and a manager that finds it there watches"
+    " it again. Leave it running: `end-run` refuses while it is open, so end the run once the walk is closed and"
+    " placed. The program is not complete before its last walk is closed and placed."
+)
+
+
+# The end of the prompt's rule for waiting with `wait_delivery: prompt` (`hl-wait --deliver`).
+WAIT_BY_PROMPT = (
+    " In this program a wait's event comes to you as your next message: start every `hl-wait` that waits (not the"
+    " one-minute look of the reconcile) with `--deliver`, detached in an ordinary call"
+    " (`nohup hl-wait --deliver --root {{ROOT}} … >/dev/null 2>&1 &`), and never with the shell tool's background option,"
+    " which would wake you a second time. The event arrives as a message that begins `hl-wait {` and ends with the file"
+    " that holds it whole: act on the line, and read the file only for what the line leaves out (a `next` command, the"
+    " paths, every check). It is the script's answer, not the operator's word, and binds you no more than any answer."
+)
+
+
+def queued_repos(settings: dict) -> list[str]:
+    """The program's repositories whose facts say `merge_queue: true`."""
+    return sorted(repo for repo, facts in (settings.get("repos") or {}).items() if isinstance(facts, dict) and facts.get("merge_queue") is True)
+
+
+def merge_queue_texts(settings: dict) -> dict:
+    """What the manager prompt says of the merge queue (`merge_queue: true`, the velocity review's change 1): nothing
+    where no repository of the program merges through one, so the prompt reads as it did. Where one does: how an
+    item's merge goes (step 7's PASS), how an outside pull request's does ("Fold it in"), and how a session that
+    starts finds one waiting in the queue (step 5's reconcile)."""
+    repos = queued_repos(settings)
+    if not repos:
+        return {"MERGE_QUEUE": "", "MERGE_QUEUE_OUTSIDE": "", "MERGE_QUEUE_START": ""}
+    names = [f"`{repo}`" for repo in repos]
+    where = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+    return {
+        "MERGE_QUEUE": (
+            f" In {where}, whose facts say `merge_queue: true`, `hl-merge` puts the pull request in the base's merge queue"
+            " at the graded head and answers `queued` at once, in place of merging: the item stays in progress, nothing"
+            " else of its run merges meanwhile, and its stream starts nothing new until it is out. Add `--queue <ID>` to"
+            " that run's wait, as `next` says. When the `queue` event wakes you, run the same `hl-merge` again: it records"
+            " the merge as of GitHub's (then Verify, step 9), or answers exit 6 `removed-from-queue` with GitHub's reason,"
+            " and `references/troubles.md` says what that asks. The queue tests each group on the latest base, so a branch"
+            " behind its base does not hold a merge there."
+        ),
+        "MERGE_QUEUE_OUTSIDE": (
+            f" In {where}, `hl-merge --outside` answers `queued` in place of merging: add `--queue-outside <PR>` to that run's wait, and when"
+            " it wakes you run the same command again. That records the merge, or answers exit 6 with GitHub's reason: a"
+            " check that failed in the merge group is the steward's, so pass it over (below); anything else, run it again."
+            " Its intent holds the repository meanwhile."
+        ),
+        "MERGE_QUEUE_START": (
+            f" In {where}, an item whose review passed and that has not merged may be waiting in the merge queue: its"
+            " `hl-merge` answers `queued` again, with the wait to arm (`--queue <ID>`). An outside pull request's"
+            " `hl-merge --outside <PR>` does the same (`--queue-outside <PR>`)."
+        ),
+    }
 
 
 def _claude_account_text(settings: dict) -> str:
@@ -411,6 +507,9 @@ def stage(spec_path, kit_source=None, run_tests: bool = True) -> dict:
         "NTFY_TOPIC": topic or "none is set: report in your replies only",
         "STREAMS": _streams_text(spec, root),
         "ROUTING_NOTES": "none beyond the defaults below.",
+        "CLOSING_AUDIT": PAGE_WALK if program.closing_audit(settings) == "pages" else "",
+        "WAIT_DELIVERY": WAIT_BY_PROMPT if settings.get("wait_delivery") == "prompt" else "",
+        **merge_queue_texts(settings),
         **spec["prompt"],
     }
     template = (kit / "references" / "manager-prompt.template.md").read_text()

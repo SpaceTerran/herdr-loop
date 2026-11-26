@@ -1,6 +1,6 @@
 # Sourced inside a worker pane before the agent starts:
 #
-#   . <kit>/scripts/hl-env.sh <claude-oauth-ref|-> <gh-token-ref> <nonce> [<loop root>]
+#   . <kit>/scripts/hl-env.sh <claude-oauth-ref|-> <gh-token-ref|-> <nonce> [<loop root>]
 #
 # Exports the worker's secrets into this shell only. The values never appear
 # on screen, in argv, or in a file. Any empty read fails closed: nothing is
@@ -18,7 +18,8 @@
 #
 # Pass `-` as the first argument for a Cursor worker, which needs no Claude
 # token, and for a Claude worker of a program whose `worker_claude_ref` is
-# `-`, which runs on the signed-in account by the operator's choice. On
+# `-`, which runs on the signed-in account by the operator's choice. Pass
+# `-` as the second for a page walk, which is given no GitHub token. On
 # success the last line printed is `hl-env ok <nonce>-ready`. The spawn
 # script waits for that line or the failure line. Both carry the nonce
 # in a form that is not in the command that was typed, so neither the typed
@@ -35,7 +36,7 @@ hl_env() {
   local claude_ref="${1:-}" gh_ref="${2:-}" nonce="${3:-}" root="${4:-}" claude_token="" gh_token="" answer="" errs=""
   unset CLAUDE_CODE_OAUTH_TOKEN GH_TOKEN GITHUB_TOKEN ANTHROPIC_API_KEY
   if [ -z "$claude_ref" ] || [ -z "$gh_ref" ] || [ -z "$nonce" ]; then
-    echo "hl-env FAILED: usage: hl-env.sh <claude-ref|-> <gh-ref> <nonce> [<loop root>]"
+    echo "hl-env FAILED: usage: hl-env.sh <claude-ref|-> <gh-ref|-> <nonce> [<loop root>]"
     return 1
   fi
   if [ -n "$root" ]; then
@@ -53,12 +54,14 @@ hl_env() {
         *) printf '%s\n' "hl-env FAILED ${nonce}: no Claude token from the keeper: hl-secrets gave no answer"; return 1 ;;
       esac
     fi
-    answer="$("$hl_env_dir/hl-secrets" --root "$root" get gh --tagged 2>/dev/null)" || :
-    case "$answer" in
-      "ok "?*) gh_token="${answer#ok }" ;;
-      "no "*) printf '%s\n' "hl-env FAILED ${nonce}: no GitHub token from the keeper: ${answer#no }"; return 1 ;;
-      *) printf '%s\n' "hl-env FAILED ${nonce}: no GitHub token from the keeper: hl-secrets gave no answer"; return 1 ;;
-    esac
+    if [ "$gh_ref" != "-" ]; then
+      answer="$("$hl_env_dir/hl-secrets" --root "$root" get gh --tagged 2>/dev/null)" || :
+      case "$answer" in
+        "ok "?*) gh_token="${answer#ok }" ;;
+        "no "*) printf '%s\n' "hl-env FAILED ${nonce}: no GitHub token from the keeper: ${answer#no }"; return 1 ;;
+        *) printf '%s\n' "hl-env FAILED ${nonce}: no GitHub token from the keeper: hl-secrets gave no answer"; return 1 ;;
+      esac
+    fi
   else
     if [ ! -x "$hl_env_dir/hl-read-secret" ]; then
       printf '%s\n' "hl-env FAILED ${nonce}: $hl_env_dir/hl-read-secret is not there to read with"
@@ -80,17 +83,19 @@ hl_env() {
         return 1
       fi
     fi
-    gh_token="$("$hl_env_dir/hl-read-secret" "$gh_ref" 2>"$errs")" || :
-    if [ -z "$gh_token" ]; then
-      answer="$(head -n 1 "$errs" 2>/dev/null)" || :
-      rm -f "$errs"
-      printf '%s\n' "hl-env FAILED ${nonce}: no GitHub token: ${answer:-hl-read-secret said nothing}"
-      return 1
+    if [ "$gh_ref" != "-" ]; then
+      gh_token="$("$hl_env_dir/hl-read-secret" "$gh_ref" 2>"$errs")" || :
+      if [ -z "$gh_token" ]; then
+        answer="$(head -n 1 "$errs" 2>/dev/null)" || :
+        rm -f "$errs"
+        printf '%s\n' "hl-env FAILED ${nonce}: no GitHub token: ${answer:-hl-read-secret said nothing}"
+        return 1
+      fi
     fi
     rm -f "$errs"
   fi
   [ -n "$claude_token" ] && export CLAUDE_CODE_OAUTH_TOKEN="$claude_token"
-  export GH_TOKEN="$gh_token"
+  [ -n "$gh_token" ] && export GH_TOKEN="$gh_token"
   export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
   export BASH_DEFAULT_TIMEOUT_MS=1800000 BASH_MAX_TIMEOUT_MS=3600000
   echo "hl-env ok ${nonce}-ready"

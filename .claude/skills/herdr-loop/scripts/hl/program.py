@@ -8,6 +8,7 @@ to type a model string or a secret reference.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from .common import Refusal, read_json
@@ -23,6 +24,13 @@ DEFAULTS = {
     # What a build or a review runs at when the manager names no effort; None means claude_effort.
     "build_effort": None,
     "review_effort": None,
+    # The window, in tokens, a Claude build's conversation is compacted against (`--autocompact`, such as `180k`;
+    # Claude Code takes 100k or more). It compacts some 30k to 40k below the window, not at it: on 2.1.329, with a
+    # build's own launch line, at 119k-121k of context with `150k` and at 57k-64k with `100k`. None: Claude Code's
+    # own, about 967k on a model with a 1M window, which most builds never reach, so a long one carries all it has
+    # read to the end. With it, the build's settings also carry a SessionStart hook that has it read its brief again
+    # after each compaction (`spawn.worker_settings`).
+    "builder_autocompact": None,
     # The efforts a manager may ask for. `low` is left out: at low Sonnet 5.5 can report a change done
     # without running a check, and stops to ask more often. `max` is left out for its cost.
     "efforts": ["medium", "high", "xhigh"],
@@ -35,6 +43,25 @@ DEFAULTS = {
     # `confirm_bound` is how large such a fix may be; what it leaves out comes from `items.CONFIRM_BOUND`.
     "confirm": "full",
     "confirm_bound": {},
+    # Whether, with `confirm: delta`, a rework after a review that passed and whose required checks then came out red
+    # on that commit gets the same delta confirm, answering those checks: `full` (the default, a full review as
+    # before) or `delta` (`items.CONFIRM_RED_CHECKS`).
+    "confirm_red_checks": "full",
+    # Two rules a review is held to, each loosened only where set (`items.OPTIONS`): `write_list` `note` takes a
+    # criterion that only limits the paths a change may write as a note for the manager, and `text_fit_widths`
+    # `recorded` lets a review count that did not run the text-fit check at every width its brief asks for.
+    "write_list": "criterion",
+    "text_fit_widths": "counted",
+    # Whether every item of a new run must say where it came from (`items.OPTIONS`): `optional` or `required`.
+    "item_origin": "optional",
+    # What the closing audit of a completed file reads (`CLOSING_AUDITS`): `contract`, each merged item's text against
+    # its contract and the code; or `pages` as well, the pages the file changed walked in a browser as a person meets
+    # them, by a worker the manager starts on the file's last merged item (`hl-spawn start --phase walk`).
+    "closing_audit": "contract",
+    # How a wait's event reaches the manager (`WAIT_DELIVERIES`): `task`, the wait runs as a background task of the
+    # manager's shell and wakes it when it exits, and the manager reads its output back; or `prompt`, the manager starts
+    # each wait detached with `hl-wait --deliver`, which types the event into its pane as its next message.
+    "wait_delivery": "task",
     # What staging learned from the spec: each stream's clone, and each repository's facts
     # (what its checks run, how a checkout is made ready, which paths a person sees or no item may change).
     "streams": {},
@@ -48,6 +75,10 @@ DEFAULTS = {
     # `hl-flow save` answers `archive.due`, and the manager moves it out with `hl-flow archive` (hl/archive.py).
     # None: the save says nothing about it, as before.
     "ledger_archive_kb": None,
+    # Logs of work that runs outside the program and that the program depends on (a loader, an import), each
+    # `{"path": <absolute path>, "what": <a few words>, "stale_minutes": <n>}`: `hl-flow save` answers `logs`, the minutes
+    # since each was written and whether that passes its `stale_minutes`. Empty: the save says nothing about logs.
+    "watch_logs": [],
     # Minutes an item may wait on its repository's required checks (`checks`) and from its merge to a passing
     # Verify (`verify`), as medians of the last merged items; `hl-flow save` says which repositories are over
     # (hl/pace.py). 15 minutes of checks is where the operator asked for the next lever (a help-desk program, 2026-11-02).
@@ -101,6 +132,33 @@ DEFAULTS = {
     "ntfy_user": None,
     "ntfy_password_ref": None,
 }
+
+
+CLOSING_AUDITS = ("contract", "pages")
+
+
+def closing_audit(cfg: dict) -> str:
+    """The program's closing audit, as its prompt and `hl-spawn` both read it: a value outside `CLOSING_AUDITS` is
+    the default, so the two cannot read one stray value two ways (staging refuses one)."""
+    value = cfg.get("closing_audit")
+    return value if value in CLOSING_AUDITS else DEFAULTS["closing_audit"]
+
+
+WAIT_DELIVERIES = ("task", "prompt")
+
+
+AUTOCOMPACT_RE = re.compile(r"^([1-9][0-9]{2})k$")
+
+
+def autocompact_problem(value) -> str | None:
+    """Why `builder_autocompact` cannot go on a build's launch line, or None. Claude Code (2.1.329) takes `auto` or
+    100k tokens or more, as `500k`, `200000` or `200`; the kit takes only `<n>k`, 100k to 999k, so that a value
+    is read one way by both."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not AUTOCOMPACT_RE.match(value):
+        return f"`builder_autocompact` is a size from 100k to 999k, such as `150k`, or null, got {value!r}"
+    return None
 
 
 def kit(root) -> Path:
@@ -237,6 +295,11 @@ def run_policy(cfg: dict, repo: str) -> dict:
         chosen.update(merge="train", train={"branch": train_branch(settings), "item_checks": repo_facts(settings, repo).get("item_checks") or []})
     if settings["confirm"] != "full":
         chosen.update(confirm=settings["confirm"], confirm_bound=settings["confirm_bound"] or {})
+    if settings["confirm_red_checks"] != "full":
+        chosen["confirm_red_checks"] = settings["confirm_red_checks"]
+    for key, first in (("write_list", "criterion"), ("text_fit_widths", "counted"), ("item_origin", "optional")):
+        if settings[key] != first:
+            chosen[key] = settings[key]
     exemptable = repo_facts(settings, repo).get("exemptable") or []
     if exemptable:
         # Fixed into the run: what its manager may exempt is what the spec said when the run was created.

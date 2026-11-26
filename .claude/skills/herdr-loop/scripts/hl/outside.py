@@ -36,15 +36,24 @@ Whether and when to fold a ready pull request into the program's own rollout
 stays the manager's decision. These scripts only say what is true and refuse
 what is not allowed.
 
-    <run>/outside/<pr>/intent.json  written before the merge; gone once it is recorded
-    <run>/outside/<pr>/merge.json   what was merged, from which run, at which commit
-    <run>/outside/<pr>/verify.json  what its deploy check found
+    <run>/outside/<pr>/intent.json   written before the merge; gone once it is recorded
+    <run>/outside/<pr>/attempt.json  a merge that did not finish, or one waiting in the merge queue
+    <run>/outside/<pr>/merge.json    what was merged, from which run, at which commit
+    <run>/outside/<pr>/verify.json   what its deploy check found
 
 Until an outside merge's deploy check has settled, nothing else of the
 program merges into that repository: not an item, not another outside pull
 request. An intent with no record (a merge that died, or one GitHub had not
 finished) holds the repository the same way, since the pull request may
 have landed.
+
+Where the spec says `merge_queue: true` for the repository, the merge is the
+merge queue's, as an item's is (hl/merge.py): the pull request is queued
+under the lock, `attempt.json` says `QUEUED`, and the intent stays, holding
+the repository, until a run of `hl-merge --outside` again finds it merged
+(and records it) or out of the queue (exit 6, with GitHub's reason). While
+an item of the program waits in the queue, no outside pull request is
+queued beside it.
 """
 
 from __future__ import annotations
@@ -57,6 +66,7 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from . import items, program, review
 from .common import Refusal, read_json, utc_now, write_json
@@ -81,7 +91,7 @@ SHARED_LOGIN = "outside_pr_shared_login"
 SHARED_LOGIN_VALUES = ("refuse", "accept")
 SETTLED = ("verified", "no-deploy", "no-run")
 LIST_FIELDS = "number,url,title,headRefName,baseRefName,isDraft,mergeable,mergeStateStatus"
-VIEW_EXTRA = ",labels,mergeable,isCrossRepository"
+VIEW_EXTRA = ",labels,mergeable,isCrossRepository,mergedAt"
 # One read of GitHub, and the whole list a save reads: a save is never held long by it.
 GH_TIMEOUT_S = 20
 READ_BUDGET_S = 45
@@ -218,6 +228,8 @@ def ready(cfg: dict, gh, budget_s: float = READ_BUDGET_S, clock=time.monotonic) 
         if clock() >= deadline:
             out["errors"].append(f"not read within {int(budget_s)} s: {', '.join(repos[i:])}")
             break
+        # Ones this program put in the merge queue, from its own records: they are under way, not to be taken up or passed over.
+        queued = {r["pr"]: r["run_id"] for r in records(cfg["root"], repo) if r["state"] == "INTENT" and r.get("queued")} if cfg.get("root") else {}
         listed = call(["pr", "list", "--repo", repo, "--label", LABEL_READY, "--state", "open", "--json", LIST_FIELDS])
         if listed.returncode != 0:
             out["errors"].append(f"{repo}: could not list pull requests: {(listed.stderr or '').strip()[:200]}")
@@ -244,6 +256,8 @@ def ready(cfg: dict, gh, budget_s: float = READ_BUDGET_S, clock=time.monotonic) 
                 # `hl-merge --outside` adopts only a pull request from a steward's or Renovate's branch.
                 "branch_allowed": branch_allowed(pr.get("headRefName")),
             }
+            if number in queued:
+                entry["queued"] = f"in the merge queue, put there by `hl-merge --outside` in run {queued[number]}: `hl-wait --queue-outside {number}`, then `hl-merge --outside {number}`"
             if clock() >= deadline:
                 entry["checks"] = "not read: out of time"
             else:
@@ -336,7 +350,7 @@ def records(root, repo: str | None = None) -> list[dict]:
                 out.append({**base, "pr": pr, "state": "UNREADABLE", "detail": (merged or intent)["unreadable"]})
                 continue
             if merged is None:
-                out.append({**base, "pr": pr, "state": "INTENT", "head_sha": intent.get("head_sha")})
+                out.append({**base, "pr": pr, "state": "INTENT", "head_sha": intent.get("head_sha"), "queued": queued_attempt(d) is not None})
                 continue
             if merged.get("state") not in ("MERGED",):
                 out.append({**base, "pr": pr, "state": "UNREADABLE", "detail": f"merge.json says state {merged.get('state')!r}"})
@@ -362,6 +376,9 @@ def pending(root, repo: str, skip_pr: int | None = None, fixing: int | None = No
         elif r["state"] == "INTENT":
             if skip_pr is not None and r["pr"] == int(skip_pr):
                 continue
+            if r.get("queued"):
+                said.append(f"outside pull request #{r['pr']} waits in the merge queue (run {r['run_id']}): run `hl-merge --outside {r['pr']}` again once it is out, to record it")
+                continue
             said.append(
                 f"outside pull request #{r['pr']} began to merge in run {r['run_id']} and has no record, so it may have landed: "
                 f"run `hl-merge --outside {r['pr']}` again (from any run in {r['repo']}) to record it"
@@ -378,7 +395,10 @@ def pending_items(root, repo: str, tools=None, repo_dir=None) -> list[str]:
     not land on: merged with a Verify that has not passed; and, read from
     GitHub, an item in progress whose pull request is merged (a merge that
     died after GitHub's answer, whatever local files a session start has
-    cleaned up since) or is armed to merge itself."""
+    cleaned up since) or is armed to merge itself; and one waiting in the
+    merge queue, read from its own record."""
+    from . import merge
+
     out = []
     for run_file in sorted(Path(root).glob("runs/*/run.json")):
         run_dir = run_file.parent
@@ -400,6 +420,9 @@ def pending_items(root, repo: str, tools=None, repo_dir=None) -> list[str]:
                     out.append(f"{run['run_id']}/{item_id} is merged and its Verify is not recorded as passed (verify={item['fields'].get('verify')})")
                 continue
             pr = item["fields"].get("pr")
+            if item["status"] == "in_progress" and merge.queued_record(run_dir, item_id):
+                out.append(f"{run['run_id']}/{item_id}'s pull request #{pr} waits in the merge queue: its `hl-merge` reads where it is")
+                continue
             if item["status"] != "in_progress" or not pr or tools is None:
                 continue
             seen = tools.gh(["pr", "view", str(pr), "--repo", run["repo"], "--json", "state,autoMergeRequest"], repo_dir, check=False)
@@ -435,6 +458,12 @@ def _in_flight(r: dict) -> bool:
         return _holder_alive(read_json(token))
     except (OSError, ValueError):
         return False
+
+
+def queued_attempt(d: Path) -> dict | None:
+    """The record of an outside merge waiting in the merge queue, in its record directory."""
+    attempt = _read(d / "attempt.json") if (d / "attempt.json").exists() else None
+    return attempt if attempt and attempt.get("state") == "QUEUED" else None
 
 
 def _clear_intents(root, repo: str, pr) -> list[dict]:
@@ -631,10 +660,13 @@ def gate(cfg: dict, root, run_dir, repo_dir, pr, tools, view: dict | None = None
     unexplained = not view.get("isDraft") and not not_green
     if state == "BLOCKED" and unexplained:
         state = merge.settled_merge_state(tools, repo_dir, slug, pr)
-    needs_update = state == "BEHIND"
+    queue = merge.queue_on(facts, False)
+    needs_update = state == "BEHIND" and not queue
+    if state == "BEHIND" and queue:
+        warnings.append("the pull request is behind its base, which the merge queue tests it on: it is not brought up to date first")
     if state == "DIRTY" or view.get("mergeable") == "CONFLICTING":
         reasons.append("the pull request conflicts with its base: the steward that opened it resolves that, not the loop")
-    elif state not in merge.MERGEABLE_STATES and not needs_update:
+    elif state not in merge.MERGEABLE_STATES and state != "BEHIND":
         warnings.append(f"merge state is {state}")
     if not checks:
         # The label is a steward's word on a change nobody here graded; the repository's own checks are the rest.
@@ -664,6 +696,7 @@ def gate(cfg: dict, root, run_dir, repo_dir, pr, tools, view: dict | None = None
         "body": body,
         "warnings": warnings,
         "shared_login_accepted": shared_accepted,
+        "queue": queue,
     }
 
 
@@ -703,7 +736,8 @@ def _merge_commit(tools, repo_dir, slug: str, pr, seen: dict) -> str | None:
     return None
 
 
-def _record(root, d: Path, ctx: dict, run: dict, merge_sha: str, tools, repo_dir, recovered: bool = False) -> dict:
+def _record(root, d: Path, ctx: dict, run: dict, merge_sha: str, tools, repo_dir, recovered: bool = False, queued: dict | None = None, at: str | None = None) -> dict:
+    """`queued`: the attempt that put it in the merge queue, and `at` when GitHub merged it."""
     from . import merge
 
     record = {
@@ -716,9 +750,11 @@ def _record(root, d: Path, ctx: dict, run: dict, merge_sha: str, tools, repo_dir
         "run": run["run_id"],
         "state": "MERGED",
         "merge_sha": merge_sha,
-        "at": utc_now(),
+        "at": at or utc_now(),
     }
-    if recovered:
+    if queued:
+        record.update(queued=True, queued_at=queued.get("at"), entry=queued.get("entry"))
+    elif recovered:
         record["recovered"] = True
     if ctx.get("shared_login_accepted"):
         record["shared_login_accepted"] = True
@@ -727,6 +763,8 @@ def _record(root, d: Path, ctx: dict, run: dict, merge_sha: str, tools, repo_dir
     write_json(d / "merge.json", record)
     # Every begun merge of this pull request is now this record: its own intent, and any another run left.
     (d / "intent.json").unlink(missing_ok=True)
+    if queued:
+        (d / "attempt.json").unlink(missing_ok=True)
     _clear_intents(root, run["repo"], ctx["pr"])
     return {"result": "merged", "outside": True, **record}
 
@@ -748,6 +786,40 @@ def merge_outside(root, run_dir, repo_dir, pr, tools, opts) -> tuple[int, dict]:
     view = _view(tools, repo_dir, slug, pr)
     if view["state"] == "MERGED":
         return _merged_already(root, run, view, tools, repo_dir, opts)
+    queue = merge.queue_on(program.repo_facts(cfg, slug), False)
+    begun = _intents(root, slug, pr) if view["state"] == "OPEN" else []
+    queued = [r for r in begun if queued_attempt(Path(r["dir"]))]
+    if begun and (queue or queued):
+        # An intent of a pull request in the merge queue is a merge under way, whatever else GitHub says of it.
+        seen = merge._queue_read(tools, repo_dir, slug, pr)
+        if seen["state"] == "MERGED":
+            return _merged_already(root, run, _view(tools, repo_dir, slug, pr), tools, repo_dir, opts)
+        if seen["in_queue"]:
+            # The wait reads the record where it is, which may be another run's than this one.
+            held_in = queued[0] if queued else begun[0]
+            if not queued and not opts.dry_run:
+                # Queued by a merge that did not live to say so.
+                write_json(Path(held_in["dir"]) / "attempt.json", {"pr": pr, "head_sha": seen["head_sha"], "state": merge.QUEUED, "entry": seen["entry"], "at": utc_now()})
+            return 0, {"result": "queued", "outside": True, "pr": pr, "head_sha": seen["head_sha"], "entry": seen["entry"], "next": _wait_next(root, held_in["run_dir"], pr)}
+        if queued:
+            since = merge.queued_since(queued_attempt(Path(queued[0]["dir"])) or {})
+            reason = merge.removal_text(seen, since)
+            if not opts.dry_run:
+                removed_at = (merge.removal_of(seen, since) or {}).get("createdAt")
+                for r in queued:
+                    attempt = queued_attempt(Path(r["dir"])) or {}
+                    write_json(Path(r["dir"]) / "attempt.json", {**attempt, "state": merge.REMOVED, "reason": reason, "removed_at": removed_at, "read_at": utc_now()})
+                _clear_intents(root, slug, pr)
+            return merge.EXIT_REMOVED, {
+                "result": "removed-from-queue",
+                "outside": True,
+                "pr": pr,
+                "reason": reason,
+                "next": (
+                    f"a required check that failed in the merge group is the steward's to fix: pass it over (`hl-handoff decline`) with GitHub's reason. "
+                    f"Taken out for anything that was not the change (a cancelled group, a flake), `hl-merge --outside {pr}` queues it again"
+                ),
+            }
     cleared = _settle_unlanded(root, slug, view, apply=not opts.dry_run)
     if view["state"] != "OPEN":
         raise Refusal(f"pull request #{pr} is {view['state']}: nothing to adopt{cleared}")
@@ -791,6 +863,21 @@ def merge_outside(root, run_dir, repo_dir, pr, tools, opts) -> tuple[int, dict]:
             raise Refusal(f"pull request #{pr} changed while it was being checked ({'; '.join(moved)}): nothing merged; run this again")
         # Written before the merge and kept until its record is: while it stands, the repository is held.
         write_json(d / "intent.json", {"head_sha": ctx["head_sha"], "run": run["run_id"], "at": utc_now(), "shared_login_accepted": ctx["shared_login_accepted"]})
+        if ctx["queue"]:
+            try:
+                entry = merge.enqueue(tools, repo_dir, slug, pr, ctx["head_sha"])
+            except Refusal:
+                # Refused before anything was asked of the queue: nothing is under way.
+                (d / "intent.json").unlink(missing_ok=True)
+                raise
+            except RuntimeError as failed:
+                # GitHub may have queued it all the same: the intent stays, and the next run of this command reads the queue.
+                attempt = {"pr": pr, "head_sha": ctx["head_sha"], "state": "MERGE-COMMAND-FAILED", "detail": str(failed)[:600], "at": utc_now()}
+                write_json(d / "attempt.json", attempt)
+                return 5, {"result": "merge-failed", "outside": True, **attempt, "next": f"run `hl-merge --outside {pr}` again: it reads whether GitHub queued it"}
+            attempt = {"pr": pr, "head_sha": ctx["head_sha"], "state": merge.QUEUED, "entry": entry, "at": utc_now()}
+            write_json(d / "attempt.json", attempt)
+            return 0, {"result": "queued", "outside": True, **attempt, "warnings": ctx["warnings"], "next": _wait_next(root, run_dir, pr)}
         argv = ["pr", "merge", str(pr), "--repo", slug, "--squash", "--match-head-commit", ctx["head_sha"], "--subject", ctx["subject"], "--body", ctx["body"]]
         merged = tools.gh(argv, repo_dir, check=False)
         if merged.returncode != 0:
@@ -824,6 +911,10 @@ def merge_outside(root, run_dir, repo_dir, pr, tools, opts) -> tuple[int, dict]:
     finally:
         merge.release_lock(tools, repo_dir, token)
         token_path.unlink(missing_ok=True)
+
+
+def _wait_next(root, run_dir, pr) -> str:
+    return f"hl-wait --root {root} --run-dir {Path(run_dir).resolve()} --queue-outside {int(pr)}"
 
 
 def _settle_unlanded(root, slug: str, view: dict, apply: bool = True) -> str:
@@ -863,6 +954,9 @@ def _merged_already(root, run: dict, view: dict, tools, repo_dir, opts, holding:
     if not merge_sha:
         return 5, {"result": "merge-commit-unknown", "outside": True, "pr": pr, "next": f"GitHub has not named the merge commit yet: run `hl-merge --outside {pr}` again"}
     d = Path(begun[0]["dir"])
+    from . import merge
+
+    waited = queued_attempt(d)
     began_in = items.load_run(Path(begun[0]["run_dir"]))
     began = read_json(Path(begun[0]["dir"]) / "intent.json") if (Path(begun[0]["dir"]) / "intent.json").exists() else {}
     ctx = {
@@ -873,7 +967,7 @@ def _merged_already(root, run: dict, view: dict, tools, repo_dir, opts, holding:
         "head_sha": view["headRefOid"],
         "shared_login_accepted": bool(began.get("shared_login_accepted")),
     }
-    result = _record(root, d, ctx, began_in, merge_sha, tools, repo_dir, recovered=True)
+    result = _record(root, d, ctx, began_in, merge_sha, tools, repo_dir, recovered=True, queued=waited, at=merge.kit_time(view.get("mergedAt")) if waited else None)
     if len(elsewhere) == len(begun):
         # This program began it, and it landed at another head: it is in the repository all the same, so it is
         # recorded and its deploy checked like any other; and the operator hears of it.
@@ -1135,16 +1229,34 @@ def decline(cfg: dict, repo: str, pr, reason: str, gh, root=None) -> dict:
         shown = {}
     if not isinstance(shown, dict) or LABEL_READY not in _labels(shown):
         raise Refusal(f"pull request #{pr} in {repo} does not carry `{LABEL_READY}`: only a pull request a steward marked ready is passed over")
+    if root is not None:
+        queued = [r for r in _intents(root, repo, pr) if r.get("queued")]
+        if queued and shown.get("state") == "OPEN":
+            # Passed over, it would still merge, and nothing would hold the repository or check its deploy.
+            raise Refusal(
+                f"pull request #{pr} in {repo} waits in the merge queue (put there by `hl-merge --outside` in run {queued[0]['run_id']}): "
+                f"the queue may merge it at any moment, so it is not passed over. Wait for it (`hl-wait --queue-outside {int(pr)}`) and run "
+                f"`hl-merge --outside {int(pr)}`, which records its merge or that it is out; then it can be passed over. To stop it now, take it out "
+                "of the queue on GitHub first, and run that `hl-merge --outside` before this"
+            )
     if root is not None and shown.get("state") in ("OPEN", "CLOSED") and not shown.get("autoMergeRequest"):
         _clear_intents(root, repo, pr)
     made = gh(["label", "create", LABEL_HELD, "--repo", repo, "--color", HELD_COLOR, "--description", HELD_DESCRIPTION])
     if made.returncode != 0 and "already exists" not in (made.stderr or "").lower():
         raise Refusal(f"the label {LABEL_HELD} could not be made in {repo}: {(made.stderr or '').strip()[:200]}")
-    edited = gh(["pr", "edit", str(int(pr)), "--repo", repo, "--remove-label", LABEL_READY, "--add-label", LABEL_HELD])
-    if edited.returncode != 0:
-        raise Refusal(f"pull request #{pr} in {repo} could not be relabeled: {(edited.stderr or '').strip()[:200]}")
+    # Through the REST issues API, as every other write of the kit: `gh pr edit` reads the organisation's
+    # projects first, which a token without `read:org` is refused (the help-desk catalog program).
+    # `rollout-held` goes on before `rollout-ready` comes off: stopped between the two, the pull request
+    # carries both, and the gate refuses it while it carries `rollout-held`.
+    issue = f"repos/{repo}/issues/{int(pr)}"
+    held = gh(["api", "--method", "POST", f"{issue}/labels", "-f", f"labels[]={LABEL_HELD}"])
+    if held.returncode != 0:
+        raise Refusal(f"pull request #{pr} in {repo} could not be relabeled: {(held.stderr or '').strip()[:200]}")
+    taken = gh(["api", "--method", "DELETE", f"{issue}/labels/{quote(LABEL_READY, safe='')}"])
+    if taken.returncode != 0 and "label does not exist" not in (taken.stderr or "").lower():
+        raise Refusal(f"pull request #{pr} in {repo} carries `{LABEL_HELD}` now, but `{LABEL_READY}` could not be taken off: {(taken.stderr or '').strip()[:200]}")
     body = f"Passed over for now by the {cfg['program']} loop: {reason}\n\nLabel `{LABEL_HELD}` is the loop's answer; the steward that marked this ready reads it at the end of its next run."
-    said = gh(["pr", "comment", str(int(pr)), "--repo", repo, "--body", body])
+    said = gh(["api", "--method", "POST", f"{issue}/comments", "-f", f"body={body}"])
     if said.returncode != 0:
         raise Refusal(f"pull request #{pr} in {repo} was relabeled, but the reason could not be posted: {(said.stderr or '').strip()[:200]}")
     return {"result": "declined", "repo": repo, "pr": int(pr), "reason": reason, "labels": {"removed": LABEL_READY, "added": LABEL_HELD}}

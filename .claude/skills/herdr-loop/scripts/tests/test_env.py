@@ -48,6 +48,10 @@ class EnvTest(unittest.TestCase):
         out = self.source("-", GH_REF, "ab12cd34")
         self.assertEqual(out, ["hl-env ok ab12cd34-ready", "rc=0", "claude= gh=set api= memory=1"])
 
+    def test_a_page_walk_gets_no_github_token_even_one_already_in_the_shell(self):
+        out = self.source(CLAUDE_REF, "-", "ab12cd34", before="export GH_TOKEN=keyring-admin GITHUB_TOKEN=keyring-admin")
+        self.assertEqual(out, ["hl-env ok ab12cd34-ready", "rc=0", "claude=set gh= api= memory=1"])
+
     def test_an_empty_claude_read_fails_closed_with_the_readers_reason_and_names_this_spawn(self):
         out = self.source(EMPTY_REF, GH_REF, "ab12cd34")
         self.assertEqual(out, ["hl-env FAILED ab12cd34: no Claude token: hl-read-secret: empty read: env:HL_TEST_EMPTY is set and empty", "rc=1", "claude= gh= api= memory="])

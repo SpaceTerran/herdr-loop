@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 from hl import items, program, spawn, train
 from hl.common import Refusal, read_json, write_json
@@ -119,6 +120,35 @@ class BuildBriefTest(BriefCase):
         self.assertNotIn("Open it in the browser and compare", cursor)
         items.route_item(self.run_dir, "A-1", "independent", False, "a script")
         self.assertIn("This item was routed as changing nothing a person looks at.", self.render())
+
+    def test_a_builder_who_looks_is_told_to_measure_text_fit_with_the_kits_script(self):
+        # the help-desk catalog program, 2026-11-18: text cut, spilling and wrapping on live pages that had each passed a look at 1280x800.
+        items.route_item(self.run_dir, "A-1", "independent", True, "a page")
+        text = self.render(engine="claude")
+        script = Path(program.load(self.root)["kit"]) / "references" / "text-fit.js"
+        self.assertIn(f"pass the whole of `{script}` as the `function` of `browser_evaluate`", text)
+        self.assertIn("1440×900", text)
+        self.assertNotIn("{{", text)
+        # A Cursor builder has no browser, so nothing to run it in.
+        self.assertNotIn("browser_evaluate", self.render(engine="cursor"))
+        self.assertTrue(script.exists())
+
+    def test_a_builder_who_looks_gets_the_check_in_its_worktree_to_run_in_one_call(self):
+        # Under `.playwright-mcp/`: the only part of the worktree the browser tool may read a script from that every
+        # clone the kit stages ignores, so it is never committed.
+        items.route_item(self.run_dir, "A-1", "independent", True, "a page")
+        runner = self.worktree.resolve() / ".playwright-mcp" / "text-fit-run.js"
+        self.assertIn(f"`browser_run_code_unsafe` with `filename` set to `{runner}`", self.render(engine="claude"))
+        self.start()
+        check = (Path(program.load(self.root)["kit"]) / "references" / "text-fit.js").read_text().strip()
+        self.assertEqual(runner.read_text(), spawn.text_fit_run_text(program.load(self.root)["kit"]))
+        self.assertTrue(runner.read_text().startswith(f"async (page) => page.evaluate(\n{check[:40]}"))
+
+    def test_a_builder_who_does_not_look_gets_no_runner(self):
+        items.route_item(self.run_dir, "A-1", "independent", False, "a script")
+        self.start()
+        self.assertNotIn("text-fit", (self.item_dir() / "build-1.brief.md").read_text())
+        self.assertFalse((self.worktree / ".playwright-mcp").exists())
 
     def test_a_floor_asks_the_builder_to_look_whatever_the_route_says(self):
         item = items.load_item(self.run_dir, "A-1")

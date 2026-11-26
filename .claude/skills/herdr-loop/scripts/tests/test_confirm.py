@@ -22,7 +22,7 @@ from hl.common import Refusal, read_json, write_json
 from .support import RunCase, SpawnCase
 from .test_flow import SERVE, FlowCase
 from .test_merge import TEST_REF, git
-from .test_review import PNG, bash, navigate, write_transcript
+from .test_review import PNG, bash, navigate, text_fit, write_transcript
 
 APP = "".join(f"line {i}\n" for i in range(1, 41))
 FIX = {"criterion": 2, "what": "prints 2, the item asks for 1", "where": "out.txt", "evidence": []}
@@ -147,7 +147,7 @@ class ConfirmCase(FlowCase):
         script would have started it: what the merge gate has to judge for itself."""
         failed = read_json(self.item_dir() / f"verdict-{confirms}.json")
         plan = {"confirms": confirms, "from_sha": start or self.first, "verdict_sha": verdict.digest(failed)}
-        entry = items.start_phase(self.run_dir, "A-1", "grade", session=session, head_sha=head, confirm=plan, how_run=spawn.served_as(self.run_dir, "A-1"))
+        entry = items.start_phase(self.run_dir, "A-1", "grade", session=session, head_sha=head, confirm=plan, how_run=spawn.served_as(self.run_dir, "A-1", None))
         write_transcript(self.home, session, [self.prints(head, start), bash("python3 -m pytest tests/test_feature.py -q"), CURL])
         self.write("A-1", f"verdict-{entry['n']}.json", json.dumps(confirm_verdict(**said)))
         # Read, as `hl-flow reviewed` leaves a review that did nothing to its checkout.
@@ -591,9 +591,9 @@ class HowItIsServedTest(ConfirmCase):
 
     def test_a_rework_served_another_way_is_reviewed_in_full(self):
         self.review_fails()
-        self.assertEqual(self.entry(1)["how_run"], spawn.served_as(self.run_dir, "A-1"))
+        self.assertEqual(self.entry(1)["how_run"], spawn.served_as(self.run_dir, "A-1", None))
         self.reworked(self.OTHER)
-        self.assertNotEqual(self.entry(1)["how_run"], spawn.served_as(self.run_dir, "A-1"))
+        self.assertNotEqual(self.entry(1)["how_run"], spawn.served_as(self.run_dir, "A-1", None))
         out = self.gives_full("the rework was not served and found ready the way review 1 was")
         self.assertEqual(out["confirm"], "full: the rework was not served and found ready the way review 1 was (the Serve and Ready lines of its report): how a build is served is outside the fix a confirm is given")
 
@@ -646,9 +646,9 @@ class HowItIsServedTest(ConfirmCase):
 
     def test_a_report_that_does_not_say_how_it_is_served_has_no_value_for_it(self):
         self.write("A-1", "build-1.md", "no such lines\n")
-        self.assertIsNone(spawn.served_as(self.run_dir, "A-1"))
+        self.assertIsNone(spawn.served_as(self.run_dir, "A-1", None))
         (self.item_dir() / "build-1.md").unlink()
-        self.assertIsNone(spawn.served_as(self.run_dir, "A-1"))
+        self.assertIsNone(spawn.served_as(self.run_dir, "A-1", None))
 
 
 INDENTED = "def pay(order):\n    if order.ok:\n        log(order)\n        charge(order)\n    return order\n"
@@ -1084,6 +1084,8 @@ class ProtectedTest(ConfirmCase):
 
 
 ALERTS = "http://127.0.0.1:8401/app/alerts"
+# The kit's text-fit check, run at each width a brief that looks asks for.
+TEXT_FIT = [text_fit(390), text_fit(1280), text_fit(1440)]
 
 
 class LookTest(ConfirmCase):
@@ -1105,7 +1107,7 @@ class LookTest(ConfirmCase):
         if route:
             items.route_item(self.run_dir, "A-1", "independent", route["look"], "a page")
         looks = [self.picture(1, "alerts-dark.png"), self.picture(1, "alerts-light.png", mode="light")]
-        return self.review_fails(calls=[CURL, navigate(ALERTS)], looks=looks, look_needed=True)
+        return self.review_fails(calls=[CURL, navigate(ALERTS), *TEXT_FIT], looks=looks, look_needed=True)
 
     def test_the_confirm_is_told_the_pages_the_failed_review_looked_at(self):
         self.looked_first(look=True)
@@ -1123,7 +1125,7 @@ class LookTest(ConfirmCase):
         self.review()
         # The same pages, whatever host name the reviewer typed, and one more besides.
         looks = [self.picture(2, "a.png", url="http://localhost:8401/app/alerts/"), self.picture(2, "b.png", mode="Light"), self.picture(2, "c.png", url="http://127.0.0.1:8401/app")]
-        code, out = self.confirmed(head, calls=[self.prints(head), CURL, navigate(ALERTS)], looks=looks)
+        code, out = self.confirmed(head, calls=[self.prints(head), CURL, navigate(ALERTS), *TEXT_FIT], looks=looks)
         self.assertEqual((code, out["effective"], out["problems"], out["exercise"]["looked"]), (0, "PASS", [], True))
         self.assertEqual(self.gate()["head_sha"], head)
 
@@ -1141,7 +1143,7 @@ class LookTest(ConfirmCase):
         head = self.fix()
         self.review()
         looks = [self.picture(2, "a.png"), self.picture(2, "b.png", url="http://127.0.0.1:8401/app/other", mode="light")]
-        code, out = self.confirmed(head, calls=[self.prints(head), CURL, navigate(ALERTS)], looks=looks)
+        code, out = self.confirmed(head, calls=[self.prints(head), CURL, navigate(ALERTS), *TEXT_FIT], looks=looks)
         self.assertEqual(code, 2)
         self.assertIn("review 2: review 1 looked at pages this confirm did not look at again: /app/alerts (light)", out["problems"])
         self.assertIn("review 1 looked at pages this confirm did not look at again: /app/alerts (light)", self.refusal())
@@ -1181,6 +1183,13 @@ class LookTest(ConfirmCase):
         self.assertTrue(out["confirm"].startswith("delta: "), out["confirm"])
         self.assertIn("Changed paths this repository's spec says a person sees: `web/page.html`.", (self.item_dir() / "grade-2.brief.md").read_text())
 
+    def test_a_fix_after_a_review_whose_text_fit_check_skipped_a_width_is_reviewed_in_full(self):
+        looks = [self.picture(1, "alerts-dark.png"), self.picture(1, "alerts-light.png", mode="light")]
+        items.route_item(self.run_dir, "A-1", "independent", True, "a page")
+        self.review_fails(calls=[CURL, navigate(ALERTS), text_fit(1280)], looks=looks, look_needed=True)
+        self.fix(("web/page.html", "<p>new</p>\n"))
+        self.gives_full("review 1 does not count: this item changes something a person looks at, and the review's text-fit check answered at 1280 px only, not at 1024 or narrower or at 1440 or wider")
+
     def test_a_fix_that_reaches_a_page_the_failed_review_never_read_is_reviewed_in_full(self):
         self.looked_first(look=True)
         self.fix(("web/other.html", "<p>new page</p>\n"))
@@ -1191,7 +1200,7 @@ class LookTest(ConfirmCase):
         head = self.fix(("web/other.html", "<p>new page</p>\n"))
         looks = [self.picture(2, "a.png"), self.picture(2, "b.png", mode="light")]
         self.on_record(head, looks=looks)
-        write_transcript(self.home, "confirm-by-hand", [self.prints(head), CURL, navigate(ALERTS)])
+        write_transcript(self.home, "confirm-by-hand", [self.prints(head), CURL, navigate(ALERTS), *TEXT_FIT])
         write_json(self.item_dir() / "serve-2.json", {"served": True, "port": 8401})
         self.assertIn("cannot stand in for a full review: the fix touches a path a person sees that was not in the diff review 1 was given (web/other.html)", self.refusal())
 

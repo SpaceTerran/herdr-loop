@@ -57,6 +57,11 @@
         "<optional: glob of protected paths the manager may exempt for one named item (`hl-items exempt`); leave the key out for none>"
       ],
       "reference": "<optional: one directory of the repository holding the pages a look is compared with, such as `brand`; served beside a looked-at build. Leave the key out for none>",
+      "serve": {
+        "command": "<optional: one command line that starts the repository's server on {port}, run for an item a person looks at whose build report's Serve line starts nothing. Leave the key out for none>",
+        "ready": "<a URL on {port} that answers once that server is up, such as http://127.0.0.1:{port}/healthz>"
+      },
+      "text_fit_check": "<optional: the name of the repository's required check that runs the text-fit check on every page at every width; a program that is `text_fit_widths: recorded` needs it. Leave the key out for none>",
    "deploys": [
     "<the workflow file that deploys the repository on a push to the base, such as `apply-main.yml`: an outside pull request's deploy check reads its runs. `[]` where a merge deploys nothing; left out, no outside pull request merges in this repository>"
    ]

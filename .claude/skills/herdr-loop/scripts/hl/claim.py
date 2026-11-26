@@ -482,6 +482,24 @@ def _manager_pid(args, procs: Procs) -> int:
     return pid
 
 
+def ledger_map(root) -> dict:
+    """The ledger's `## ` headings with their line numbers, and its Now section whole: what a session starting on
+    the program read by hand after `hl-claim check` (208 reads on the help-desk catalog program in the week to 2026-11-19).
+    What cannot be read is said, and never fails the check."""
+    try:
+        path = Path(read_json(Path(root) / "program.json")["ledger"])
+        lines = path.read_text().splitlines()
+    except (KeyError, TypeError, ValueError, OSError) as exc:
+        return {"error": f"the ledger could not be read: {exc}"[:300]}
+    headings = [[n, line] for n, line in enumerate(lines, start=1) if line.startswith("## ")]
+    start = next((n for n, line in headings if line.startswith("## Now")), None)
+    now = None
+    if start is not None:
+        end = next((n for n, _line in headings if n > start), len(lines) + 1)
+        now = "\n".join(lines[start : end - 1]).strip() or None
+    return {"file": str(path), "headings": headings, "now": now}
+
+
 def main(argv: list[str] | None = None, procs: Procs | None = None) -> int:
     args = _parser().parse_args(argv)
     procs = procs or Procs()
@@ -506,7 +524,8 @@ def main(argv: list[str] | None = None, procs: Procs | None = None) -> int:
                 overrides[name] = path
             emit(pin(args.root, overrides))
         elif args.cmd == "check":
-            emit(check_pins(args.root, tuple(args.name) if args.name else PINNED))
+            # Every session starts here, so the ledger's map comes with it.
+            emit({**check_pins(args.root, tuple(args.name) if args.name else PINNED), "ledger": ledger_map(args.root)})
         elif args.cmd == "repin":
             emit(repin(args.root, args.name, args.note, args.path))
     except Refusal as refusal:

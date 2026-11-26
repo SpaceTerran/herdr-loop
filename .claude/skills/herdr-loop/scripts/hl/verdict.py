@@ -53,7 +53,9 @@ go through the criteria again; it answers that fix list, entry by entry:
       "fix_list", "looks", "look_needed", "findings", "how_run" }
 
 `answers` has one entry for each entry of the failed review's fix list, in
-its order, numbered from 1. `delta` says whether the fix breaks anything
+its order, numbered from 1; for a confirm of a fix for red checks, one for
+each required check that came out red after the review before it passed,
+in the order its attempt names them (`red_checks`). `delta` says whether the fix breaks anything
 the failed review passed. `fix_list` is what is still to change. A PASS has
 every entry `fixed`, a `clean` delta, an empty fix list and no look that
 differs. Which review is a confirm is read from the attempt log beside the
@@ -464,7 +466,9 @@ def _check_confirm(item_dir: Path, data, confirm: dict, transcript, out: dict) -
     if not isinstance(fixes, list) or digest(failed) != confirm.get("verdict_sha"):
         out["problems"].append(f"{first.name} is not the verdict this confirm was given to answer: the file changed after the confirm started")
         return out
-    out["problems"] += confirm_shape_problems(data, len(fixes))
+    # A fix for red checks answers the checks on its own attempt, which only `hl-spawn` writes; the review before it passed, with no fix list.
+    entries = confirm["red_checks"] if isinstance(confirm.get("red_checks"), list) else fixes
+    out["problems"] += confirm_shape_problems(data, len(entries))
     if out["problems"]:
         return out
     out["raw"] = data["verdict"]

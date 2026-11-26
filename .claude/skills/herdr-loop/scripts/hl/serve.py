@@ -125,7 +125,9 @@ def _shown(command: str, width: int = 500) -> str:
     return command if len(command) <= width else f"{command[:half]} … {command[-half:]}"
 
 
-def _build(run_dir, item_id: str) -> tuple[dict, int, dict, Path]:
+def _build(run_dir, item_id: str, default_serve: dict | None = None) -> tuple[dict, int, dict, Path]:
+    """The item, its build's number, how that build is served (`contractfmt.serving`, with the repository's own
+    serve command where it has one: `default_serve`) and the item's directory."""
     item = items.load_item(run_dir, item_id)
     n = items.load_attempts(run_dir, item_id)["build"]
     d = items.item_dir(run_dir, item_id)
@@ -138,12 +140,12 @@ def _build(run_dir, item_id: str) -> tuple[dict, int, dict, Path]:
         how = contractfmt.how_to_run(report.read_text())
     except contractfmt.ContractError as exc:
         raise Refusal(f"{report.name}: {exc}") from exc
-    return item, n, how, d
+    return item, n, contractfmt.serving(how, bool((item.get("route") or {}).get("look")), default_serve, item["fields"].get("port")), d
 
 
 def start(root, run_dir, item_id: str, herdr, host: Host, workspace: str | None = None, timeout_s=READY_TIMEOUT_S):
     cfg = program.load(root)
-    item, n, how, d = _build(run_dir, item_id)
+    item, n, how, d = _build(run_dir, item_id, program.repo_facts(cfg, items.load_run(run_dir)["repo"]).get("serve"))
     path = record_path(run_dir, item_id, n)
     if path.exists() and not read_json(path).get("stopped_at"):
         raise Refusal(f"build {n} of {item_id} is already being served; run `hl-serve stop` first")
@@ -151,6 +153,9 @@ def start(root, run_dir, item_id: str, herdr, host: Host, workspace: str | None 
     if not worktree or not Path(worktree).is_dir():
         raise Refusal(f"{item_id} has no worktree recorded (`hl-items set --field worktree=<path>`)")
     record = {"build": n, "command": how["serve"], "ready_kind": how["ready_kind"], "ready": how["ready"]}
+    if how.get("serve_default"):
+        # Its report's Serve line starts nothing: the repository's own serve command, from the spec, runs in its place.
+        record["serve_default"] = True
     began = host.now()
 
     if how["serve"].strip() == "true":

@@ -20,6 +20,7 @@ Layout under a run directory:
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
 from datetime import datetime, timezone
@@ -33,11 +34,15 @@ WORKSPACE_FILE = "workspace.json"
 # One bound is not a phase: how many of an item's reviews may be given back
 # after they passed (`void_attempt`). It is counted from the attempt log.
 GIVE_BACK = "give_back"
-BOUNDS = {"agree": 2, "build": 2, "grade": 2, "correction": 1, "ci_rerun": 1, "verify": 2, GIVE_BACK: 1}
+# `walk`: the page walk of a completed file (`closing_audit: pages`), on the file's last merged item. One for an item:
+# a walk that ended without its result is given back (`void_attempt`), and one that wrote it is the walk.
+BOUNDS = {"agree": 2, "build": 2, "grade": 2, "correction": 1, "ci_rerun": 1, "verify": 2, "walk": 1, GIVE_BACK: 1}
 # In attempts.json: how many Verify tries were made before the item's line was last corrected (`verify-line`), so not counted.
 VERIFY_SET_ASIDE = "verify_set_aside"
 # What `start_phase` counts, each in its own number in attempts.json.
 COUNTED = tuple(k for k in BOUNDS if k != GIVE_BACK)
+# The phases an item takes once it has merged: the deploy check, and the page walk of its file.
+AFTER_MERGE = ("verify", "walk")
 # How a run decides whether an item gets an independent premise check before
 # its build. `always`: every item does, and a build is refused without one
 # (the kit's first behaviour, and what a run without a policy has). `routed`:
@@ -67,6 +72,13 @@ LANDINGS = ("squash", "merge")
 # fresh reviewer confirms the fix alone: it answers the fix list entry by entry and is given the change between
 # the two heads. `hl/confirm.py` decides when, and the merge gate checks it again. Once for an item.
 CONFIRMS = ("full", "delta")
+# What reviews a fix for red checks: a rework after a full review that passed, whose pull request's required checks
+# then came out red on the commit it passed. `full`: a full fresh review (the kit's first behaviour). `delta`, in a run
+# that is `confirm: delta`: the same delta confirm, answering the red checks entry by entry in place of a fix list
+# (`hl/confirm.py`). Fixed into the run like `confirm`; read with `red_checks_confirmed`.
+# With `review_with_ci` a review often passes while the checks are still running: on the help-desk catalog program in the
+# week from 2026-11-12, 31 reworks followed a pass whose checks then came out red, and every one had a full review.
+CONFIRM_RED_CHECKS = ("full", "delta")
 # The kind of a review that is a delta confirm, in the attempt log. A review without a kind is a full one.
 CONFIRM = "confirm"
 # How large a fix a delta confirm may cover. Past it the fix is new work, and gets a full review.
@@ -78,6 +90,23 @@ CONFIRM = "confirm"
 #                 fixed and one caller. More is a fix that has spread.
 # No rework ran in the first program, so none of the three is measured: they are where the canary starts.
 CONFIRM_BOUND = {"share": 0.25, "lines": 40, "files": 2}
+# Settings that each loosen one rule a review is held to, fixed into a run when it is made like the rest of its
+# policy, and recorded only when not their first value, the kit's behaviour before them: a run made without one
+# reads as it always did. Read with `option`. From the velocity review of the help-desk catalog program (2026-11-19), whose
+# week to that day had 62 reviews that did not pass, many on rules about the paperwork and not the change.
+#   write_list       a criterion that only limits the paths a change may write (`git diff --name-only ... lists only
+#                    ...`). `criterion`: reviewed like any other. `note`: the drafter of a contract writes none, a
+#                    reviewer marks one `checks` and names each path the change wrote outside it in a finding for
+#                    the manager; the paths no item may change are held at the merge either way. 15 of the 62 were
+#                    such a line, each sent to a correction and a second review.
+#   text_fit_widths  a review of an item a person looks at whose text-fit check did not answer at every width its
+#                    brief asks for (`review.TEXT_FIT_WIDTHS`). `counted`: it does not count for a merge. `recorded`:
+#                    the widths it answered are recorded and it counts; the required text-fit check in CI is then
+#                    the gate.
+#   item_origin      `optional`: an item may say where it came from (`**Origin.**`, `backlog.ORIGINS`). `required`:
+#                    a file with an item that does not is refused when its run is made. A record, not a check: it
+#                    catches no defect, so it is off unless a program turns it on (`references/design.md`).
+OPTIONS = {"write_list": ("criterion", "note"), "text_fit_widths": ("counted", "recorded"), "item_origin": ("optional", "required")}
 EVALUATOR_PHASES = ("agree", "grade", "correction")
 BRAKE_COUNT = 3
 # A contract draft is not counted against a bound: it carries the number of
@@ -95,6 +124,7 @@ RESULT_FILES = {
     "grade": "verdict-{n}.json",
     "correction": "correction-{n}.md",
     "verify": "verify-{n}.txt",
+    "walk": "walk-{n}.md",
     DRAFT: "contract-draft-{n}.md",
 }
 
@@ -125,6 +155,59 @@ def policy(run: dict) -> dict:
         # The protected paths an item of this run may be exempted for (`hl-items exempt`); none for a run created without them.
         "exemptable": list(recorded.get("exemptable") or []),
     }
+
+
+def red_checks_confirmed(run: dict) -> bool:
+    """Whether a fix for required checks that came out red after a passed
+    review may get a delta confirm (`confirm_red_checks: delta`). Not part
+    of `policy`: a run created without the setting reads as it always did."""
+    recorded = run.get("policy") or {}
+    return policy(run)["confirm"] == "delta" and recorded.get("confirm_red_checks") == "delta"
+
+
+def red_checks_record(item_dir, build: int) -> Path:
+    """Where `hl-wait --checks` keeps, as data, the required checks that came
+    out red on a build's head: beside `checks-<build>.md`, which says the
+    same to the builder in words."""
+    return Path(item_dir) / f"checks-{build}.json"
+
+
+def red_checks_digest(record: dict) -> str:
+    """A record of red checks as one value."""
+    return sha256_text(json.dumps(record, sort_keys=True))
+
+
+def keep_red_checks(run_dir, item_id: str, build: int, record: dict | None) -> None:
+    """Keep the digest of the red-checks record `hl-wait --checks` wrote of
+    build `build`'s head on that build's attempt, or take it off when the
+    checks are green again (`record` None). The record lies beside the
+    rework's builder, which runs with its permission checks off: a delta
+    confirm takes it as the checks to answer only while it is the one a
+    script wrote (`confirm.red_checks`). Called by `hl-wait` and by
+    nothing else."""
+    attempts = load_attempts(run_dir, item_id)
+    entry = next((e for e in reversed(attempts["log"]) if e["phase"] == "build" and e.get("n") == build and not e.get("voided")), None)
+    if entry is None:
+        return
+    if record is None:
+        if entry.pop("red_checks_sha", None) is None:
+            return
+    else:
+        entry["red_checks_sha"] = red_checks_digest(record)
+    save_attempts(run_dir, item_id, attempts)
+
+
+def option(run: dict, key: str) -> str:
+    """One of `OPTIONS` as the run has it: its first value for a run made without it, and for a value that is
+    not one of the key's (`check_policy` refuses one at creation; run.json lies where a worker can write), so that
+    the review's rule and the brief that states it can never read a stray value two ways."""
+    value = (run.get("policy") or {}).get(key)
+    return value if value in OPTIONS[key] else OPTIONS[key][0]
+
+
+def options_on(run: dict) -> dict:
+    """The `OPTIONS` a run has away from their first value."""
+    return {key: option(run, key) for key in OPTIONS if option(run, key) != OPTIONS[key][0]}
 
 
 def on_train(run: dict) -> bool:
@@ -178,11 +261,25 @@ def check_policy(policy_in: dict | None) -> dict | None:
             raise Refusal("a delta confirm of a rework needs reviews that read the code and write a fix list (`review: code`)")
         # Written out in full: a run keeps the bound it started with, whatever the kit's own becomes.
         checked.update(confirm="delta", confirm_bound=_confirm_bound(policy_in.get("confirm_bound") or {}))
+    red = policy_in.get("confirm_red_checks", "full")
+    if red not in CONFIRM_RED_CHECKS:
+        raise Refusal(f"confirm_red_checks {red!r} is not one of {', '.join(CONFIRM_RED_CHECKS)}")
+    if red == "delta":
+        if confirm != "delta":
+            # It is the same confirm, given one more kind of rework: without `confirm: delta` there is none to give.
+            raise Refusal("a delta confirm of a fix for red checks extends the delta confirm of a rework: it needs `confirm: delta`")
+        checked["confirm_red_checks"] = "delta"
     exemptable = policy_in.get("exemptable") or []
     if not isinstance(exemptable, list) or not all(isinstance(e, str) and e.strip() for e in exemptable):
         raise Refusal("`exemptable` must be a list of path patterns")
     if exemptable:
         checked["exemptable"] = [e.strip() for e in exemptable]
+    for key, values in OPTIONS.items():
+        value = policy_in.get(key, values[0])
+        if value not in values:
+            raise Refusal(f"{key} {value!r} is not one of {', '.join(values)}")
+        if value != values[0]:
+            checked[key] = value
     return checked
 
 
@@ -211,7 +308,8 @@ def load_attempts(run_dir, item_id: str) -> dict:
     if not path.exists():
         # Everything a merge rests on is in it, and nothing else holds a copy.
         raise Refusal(f"{path} is missing: it is the record of every attempt of {item_id}, and no command makes it again. Leave the item as it is and tell the operator")
-    return read_json(path)
+    # A phase counted since the item's record was made (`walk`) has had no attempt in it.
+    return {**{phase: 0 for phase in COUNTED}, **read_json(path)}
 
 
 def save_attempts(run_dir, item_id: str, attempts: dict) -> None:
@@ -287,6 +385,15 @@ def init_run(
             f"a run's files never change once it exists, but for an item's Verify line{why}"
         )
 
+    if (policy or {}).get("item_origin") == "required":
+        unsaid = [it.id for _path, _sha, its in parsed for it in its if it.origin is None]
+        if unsaid:
+            raise Refusal(
+                f"this run is made with `item_origin: required`, and these items have no {backlog.MARKER_ORIGIN} line: {', '.join(unsaid)}. "
+                f"Add one to each: `{backlog.MARKER_ORIGIN} new`, `repair: <the id it repairs>`, `audit: <which>` or `rule: <which>` "
+                "(`references/authoring.md`, \"Origin\")"
+            )
+
     order: list[str] = []
     for path, _, items in parsed:
         for it in items:
@@ -305,6 +412,7 @@ def init_run(
                     "verify_command": it.verify_command,
                     "verify_wait_min": it.verify_wait_min,
                     "floor": it.floor,
+                    "origin": it.origin,
                     "status": "pending",
                     "note": None,
                     "contract": None,
@@ -412,6 +520,14 @@ def next_item(run_dir) -> dict:
 
 
 # ---------------------------------------------------------------- start / void
+
+
+def item_text(run_dir, item_id: str) -> dict:
+    """An item's title, Scope and other markers (`backlog.item_fields`), read from its `item.md`."""
+    item = load_item(run_dir, item_id)
+    path = item_dir(run_dir, item_id) / "item.md"
+    fields = backlog.item_fields(path.read_text()) if path.exists() else {"scope": None, "markers": {}}
+    return {"id": item_id, "title": item.get("title"), **fields}
 
 
 def _agreed_contract(run_dir, item: dict, attempts: dict) -> str | None:
@@ -637,11 +753,12 @@ def start_phase(
     item = load_item(run_dir, item_id)
     run = load_run(run_dir)
     routed = policy(run)["premise"] == "routed"
-    # The deploy check is the one phase that runs after the merge.
-    if item["status"] in TERMINAL and not (phase == "verify" and item["status"] == "merged"):
+    # The deploy check and the page walk are the phases that run after the merge.
+    if item["status"] in TERMINAL and not (phase in AFTER_MERGE and item["status"] == "merged"):
         raise Refusal(f"{item_id} is {item['status']}; it takes no further phases")
-    if phase == "verify" and item["status"] != "merged":
-        raise Refusal(f"{item_id} is {item['status']}; the deploy check runs only after the merge")
+    if phase in AFTER_MERGE and item["status"] != "merged":
+        what = "the deploy check" if phase == "verify" else "the page walk of its file"
+        raise Refusal(f"{item_id} is {item['status']}; {what} runs only after the merge")
     attempts = load_attempts(run_dir, item_id)
     live = [e for e in attempts["log"] if not e.get("voided")]
     builder_sessions = {e["session"] for e in live if e["phase"] == "build"} | {
@@ -703,6 +820,9 @@ def start_phase(
         entry["contract_sha"] = sha256_text(contract_path.read_text())
         if confirm:
             entry.update(kind=CONFIRM, confirms=confirm["confirms"], from_sha=confirm["from_sha"], verdict_sha=confirm["verdict_sha"])
+            if confirm.get("red_checks") is not None:
+                # A confirm of a fix for red checks: the checks it answers, in order, and the record they were read from, as one value.
+                entry.update(red_checks=confirm["red_checks"], checks_sha=confirm["checks_sha"])
         if baseline is not None:
             entry["baseline"] = baseline
         if how_run:
@@ -896,8 +1016,16 @@ def shipped_problem(run_dir, item_id: str) -> str | None:
 
 
 def set_status(
-    run_dir, item_id: str, status: str, note: str | None, reopen: bool = False, superseded_by: str | None = None, superseded_run: str | None = None
+    run_dir,
+    item_id: str,
+    status: str,
+    note: str | None,
+    reopen: bool = False,
+    superseded_by: str | None = None,
+    superseded_run: str | None = None,
+    at: str | None = None,
 ) -> dict:
+    """`at`: when it happened, where that was not now. Only hl-merge passes it, for a merge the merge queue made."""
     item = load_item(run_dir, item_id)
     current = item["status"]
     d = item_dir(run_dir, item_id)
@@ -914,6 +1042,14 @@ def set_status(
             raise Refusal(f"{item_id} is {current}; only an item in progress can become {status}")
         if not note:
             raise Refusal(f"--note is required to mark an item {status} (write it as 'class: detail')")
+        merge_record = d / "merge.json"
+        if merge_record.exists() and (read_json(merge_record) or {}).get("state") == "QUEUED":
+            # The queue may merge it whatever the item says, and then nothing could record the merge or check its deploy.
+            raise Refusal(
+                f"{item_id}'s pull request waits in the base's merge queue (merge.json says QUEUED), which may merge it at any moment: "
+                f"run `hl-merge --id {item_id}` first, which records its merge or that it is out of the queue; then this. To stop the "
+                f"merge, take the pull request out of the queue on GitHub, then run that `hl-merge`"
+            )
     elif status == "skipped" and superseded_by:
         # A failed item whose work a repair item carried and shipped: nothing of it is left to do, so its run can close.
         if current != "failed":
@@ -951,9 +1087,11 @@ def set_status(
     if superseded_by and status != "skipped":
         raise Refusal("--superseded-by goes only with --status skipped")
 
+    if at is not None and status != "merged":
+        raise Refusal("a time is given only to a merge")
     item["status"] = status
     item["note"] = note
-    item[stamp] = utc_now()
+    item[stamp] = at or utc_now()
     save_item(run_dir, item)
 
     run = load_run(run_dir)
@@ -1412,7 +1550,8 @@ def _parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("start", help="count a phase against its bound and log it")
     s.add_argument("--id", required=True)
-    s.add_argument("--phase", required=True, choices=list(COUNTED))
+    # A page walk is counted by `hl-spawn start`, which first checks that it may run and on which item.
+    s.add_argument("--phase", required=True, choices=[p for p in COUNTED if p != "walk"])
     s.add_argument("--session")
     s.add_argument("--drafter-session")
     s.add_argument("--engine", choices=["claude", "cursor"])
@@ -1584,13 +1723,16 @@ def main(argv: list[str] | None = None, procs=None) -> int:
                     "run_id": run["run_id"],
                     "work": run.get("work"),
                     "stream": run.get("stream"),
-                    "policy": policy(run),
+                    # Said when it is on, so the manager reads it where it reads the rest; a run without it reads as before.
+                    "policy": {**policy(run), **({"confirm_red_checks": "delta"} if red_checks_confirmed(run) else {}), **options_on(run)},
                     "items": len(run["order"]),
                     "order": run["order"],
                 }
             )
         elif args.cmd == "next":
-            emit(next_item(args.run_dir))
+            found = next_item(args.run_dir)
+            # The item it names, as the manager reads it before routing: its Scope and markers, not the file.
+            emit({**found, "item": item_text(args.run_dir, found["next"])} if found.get("next") else found)
         elif args.cmd == "list":
             emit(list_items(args.run_dir))
         elif args.cmd == "show":
@@ -1599,6 +1741,9 @@ def main(argv: list[str] | None = None, procs=None) -> int:
                     "item": load_item(args.run_dir, args.id),
                     "attempts": load_attempts(args.run_dir, args.id),
                     "timeline": timeline(args.run_dir, args.id),
+                    "text": item_text(args.run_dir, args.id),
+                    # Which phases have left files, the corrections and checks among them, without an `ls`.
+                    "files": sorted(p.name for p in item_dir(args.run_dir, args.id).iterdir() if p.is_file()),
                 }
             )
         elif args.cmd == "start":

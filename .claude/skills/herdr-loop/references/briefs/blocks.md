@@ -6,7 +6,29 @@ Paragraphs that `hl-spawn` puts into a brief in place of a placeholder, chosen f
 
 **This item changes something a person looks at.** Open every page it touches with the browser tool on the running build and compare it with the reference the item names, in every mode the item names (dark and light, for one), at a 1280×800 viewport. Compare what is measurable as measured values (a computed color, a size, a spacing, the font), and the page as a whole by eye against the reference. A value a few pixels or one shade off in one mode is a defect. Keep one screenshot for each page and mode and record each as a look. A page you could not open is `not_checked`, never `pass`. A look is a page the browser tool opened: the merge counts the browser tool's navigations to the served build (`browser_navigate`), so a page a Playwright script or any other program opened from the shell is not a look, whatever its screenshot shows. Such a script exercises the build; it does not look at it.
 
+{{TEXT_FIT_STEP}}
+
 {{REFERENCE}}
+
+### block: text-fit
+
+**Text fits, at every width and with long data.** Each page you look at is also looked at at 1440×900 and at the narrowest width it is made for (390×844 for a page with a phone layout, 1024×768 for one without), with `browser_resize`, as well as at 1280×800. Look with data as long as real data: if what is served has only short names and recent dates, first add records with long names (30 characters and more), long titles and subjects (80 and more), long values in each column the page lists, and dates older than a week, so every value shows its longest form. At each width run the text-fit check in one call, `browser_run_code_unsafe` with `filename` set to `{{TEXT_FIT_RUN}}` (the kit's check, put where this session's browser tool may read it), then take the screenshot (the check outlines what it finds). If the browser tool refuses that file, pass the whole of `{{TEXT_FIT}}` as the `function` of `browser_evaluate` instead. It answers `counts` and the first findings of each kind: text `cut` with no ellipsis, drawn `outside` the box that draws it, an `overlap` with other text, an ellipsis that leaves fewer than 7 characters (`hard_ellipsis`), a field whose placeholder or value is wider than the field (`input_cut`), a short value that wraps (`short_wrap`), and horizontal scroll (`hscroll`). Any of them on what this item changes is a defect, unless the item or its reference asks for that ellipsis or wrap; a reviewer puts each in the fix list and cites the check's answer in the look's note. On the help-desk catalog program (2026-11-18) the operator found a requester cut to "· …", a date drawn past its card and a field cut to "+ Add ta" on live pages, each of which had passed its review at 1280×800 on a seed of short names and "just now" dates. {{TEXT_FIT_RULE}}
+
+### block: serve-own
+
+the Serve line must start the real server: an empty line, `true`, `:` or any other no-op is sent back, because a reviewer cannot look at a build that is not running.
+
+### block: serve-default
+
+the repository has its own serve command, from the program's spec: when your Serve line starts nothing (an empty line, `true`, `:`), `{{SERVE_DEFAULT}}` is served on port {{PORT}} in its place, ready at `{{SERVE_DEFAULT_READY}}`, and your Ready line is not used. Write your own Serve and Ready lines only where this build must be started another way. A line that starts nothing and then something more (`echo starting; npm run dev`) is sent back, because it is neither.
+
+### block: text-fit-counted
+
+A review is read for the widths the check answered (its `width`): one that did not run it at 1280, at 1440 or wider and at 1024 or narrower does not count toward the merge. On the same program, three reviews that skipped a width had passed.
+
+### block: text-fit-recorded
+
+The widths the check answered (its `width`) are recorded with the review. The repository's required text-fit check runs on the pull request as well.
 
 ### block: no-look-review
 
@@ -22,6 +44,14 @@ Do not reinstall, run the full suite or rebuild: CI repeats them. Read the code,
 
 {{NOT_IN_CI}}
 
+### block: write-list-review
+
+**The paths the item may write are a note in this program, not a criterion.** A criterion that only limits which paths the change may write (`git diff --name-only origin/{{BASE}}...HEAD` lists only …) is `checks`, whatever paths the diff touches. For each path the diff touches outside those the item names, write one finding of kind `criterion` with `criterion` set to `null`: the path, and what in the change needed it. It is for whoever writes the next items, and nothing is corrected for it. The paths no item may change are another matter: the merge refuses a change to one, whatever this review says.
+
+### block: write-list-contract
+
+The paths the item may write are its Scope's, and in this program no criterion limits them: leave out a line of the item that only does (`git diff --name-only origin/{{BASE}}...HEAD` lists only …). A reviewer names each path a build writes outside them for the manager, and nothing fails for it; the paths no item may change are held at the merge.
+
 ### block: checks-unknown
 
 **Suites.** Nothing is recorded about what this repository's required checks run, so where a criterion names a suite or a check, run it or read its state yourself (`gh pr checks {{PR_NUMBER}} --repo {{REPO}}` shows the checks; if one a criterion needs is unfinished, mark that criterion `not_checked`). A script holds the required checks green on the commit that merges, whatever your verdict says.
@@ -35,6 +65,9 @@ No required check runs these, so nothing but this review stands between them and
 ### block: look-unknown-review
 
 **Decide first whether this change alters anything a person looks at.** If it does, set `look_needed` to `true`, open every page it affects with the browser tool on the running build, in every mode the item names or the page has, at a 1280×800 viewport, and compare each with the reference the item names: measurable things as measured values, and the page as a whole by eye. A value a few pixels or one shade off in one mode is a defect. Keep one screenshot for each page and mode and record each as a look. A look is a page the browser tool opened: the merge counts the browser tool's navigations to the served build (`browser_navigate`), so a page a Playwright script or any other program opened from the shell is not a look, whatever its screenshot shows. Such a script exercises the build; it does not look at it.
+
+{{TEXT_FIT_STEP}}
+
 ### block: testing-touched
 
 - **Test what you touch while you work**, and before you push run the tests and linters that cover what you changed (the tests related to the files you touched, not the full suites), in the foreground or with a `runner`. The repository's required checks run its full suites once, on your pull request, so a full local run of them is not asked of you; what its facts list as `ci_covers` is run there, and what they list as `not_in_ci` is yours where you touch it; if a check comes out red, the failed runs come back to you to fix. Two kinds of check fail on what a change adds far more often than on a line it edits, so run them on what you touched even though CI runs them too: the scanners and linters the repository pins, at the version it pins (a security scanner such as checkov over the infrastructure you changed, a formatter's check), and any test that holds a list of files to the tree (an index in a README, a registry of scripts or of pages) when you added, renamed or removed such a file. "The tests related to the files you touched" are not only the tests beside them: a test in another directory that asserts what you changed is related too, and is found by searching the tests for the name, route or message you changed, not by where it sits. On one program 20 of 21 red test runs failed in a test file the pull request had not touched, and those items took a median 98 minutes against 36 for the rest. Send long output through `tee` to a file under `.scratch/` and read that file; do not run a slow command twice to see its output differently.
@@ -46,6 +79,8 @@ No required check runs these, so nothing but this review stands between them and
 ### block: look-builder
 
 - **This item changes something a person looks at.** Open it in the browser and compare it with the reference the item names, in every mode the item names, before you call it built: the measurable things as measured values, and the page as a whole by eye. The reviewer does the same, to the pixel. **Serve the pages and check in the browser every value the item or its reference pins** (colours, sizes, padding and gaps, button variants, labels), using computed styles where the value is a style, and list each one in your report with what you measured. A pinned value you did not measure is the usual reason a review fails. A `.playwright-mcp/` directory in the worktree belongs to the browser tool and is never committed.
+
+{{TEXT_FIT_STEP}}
 
 ### block: look-builder-none
 
@@ -95,9 +130,27 @@ The full checks failed on that branch when it was last tested, and a repair is u
 
 {{TRAIN_RED}}
 
+### block: confirm-from-review
+
+Review {{FIRST_N}} was a full review of the change at commit `{{FROM_SHA}}`, and failed it with the fix list below.
+
+### block: confirm-from-checks
+
+Review {{FIRST_N}} was a full review of the change at commit `{{FROM_SHA}}`, and passed it. The pull request's required checks then came out red on that same commit, and the fix list below is those checks, one entry for each.
+
+### block: fix-list-review
+
+Its fix list, numbered as you answer it:
+
+### block: fix-list-checks
+
+The required checks that came out red on `{{FROM_SHA}}`, numbered as you answer them. `{{CHECKS_FILE}}` lists them with the command that prints each failed run's log: read the log first, for it names the tests and steps that failed. For a check, `fixed` means you ran what failed in it (those tests, that step's command) in the checkout and saw it pass now. The check itself runs again on the pull request, and nothing merges until it is green.{{REWORK_NOTE_LINE}}
+
 ### block: look-confirm
 
 **A person looks at what this item changes.** Review {{FIRST_N}} looked at the pages below. Open each again with the browser tool on the running build, in the same mode, at a 1280×800 viewport, and compare it with the reference the item names: what is measurable as measured values, and the page as a whole by eye. A value a few pixels or one shade off in one mode is a defect. Open any other page the fix changes as well. Keep one screenshot for each page and mode and record each as a look: the merge checks that every page below has one. A look that differs is an entry in your fix list. A look is a page the browser tool opened: the merge counts the browser tool's navigations to the served build (`browser_navigate`), so a page a Playwright script or any other program opened from the shell is not a look, whatever its screenshot shows. Such a script exercises the build; it does not look at it.
+
+{{TEXT_FIT_STEP}}
 
 {{REFERENCE}}
 

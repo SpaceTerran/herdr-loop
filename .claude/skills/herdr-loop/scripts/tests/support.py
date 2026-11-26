@@ -121,6 +121,50 @@ done(64)
 '''
 
 
+# GitHub's merge queue as its GraphQL API answers (hl/merge.py `QUEUE_QUERY` and `ENQUEUE`), kept in `state["queue"]`:
+# `enabled` (the base has one), `in` and `entry` (the pull request's place), `removed` (its RemovedFromMergeQueueEvent
+# nodes), `error` (GitHub's errors), `enqueued` (each head put in), `enqueued_at` (when the next one is, by GitHub's
+# clock). The pull request is the fake's own `state["pr"]`.
+QUEUE_FAKE = r'''
+if args[:2] == ["api", "graphql"]:
+    given = dict(args[i + 1].split("=", 1) for i in range(2, len(args) - 1) if args[i] in ("-f", "-F"))
+    queue = state.setdefault("queue", {})
+    if queue.get("error"):
+        print(json.dumps({"errors": [{"message": queue["error"]}]}))
+        done(1)
+    pr = state["pr"]
+    if "enqueuePullRequest" in given["query"]:
+        queue.setdefault("enqueued", []).append(given.get("head"))
+        queue["in"] = True
+        queue["entry"] = {"id": "MQE_1", "state": "QUEUED", "position": 1, "enqueuedAt": queue.get("enqueued_at", "2026-11-20T01:00:00Z")}
+        print(json.dumps({"data": {"enqueuePullRequest": {"mergeQueueEntry": queue["entry"]}}}))
+        done()
+    node = {
+        "id": "PR_" + str(pr["number"]),
+        "state": pr["state"],
+        "headRefOid": pr["headRefOid"],
+        "mergedAt": pr.get("mergedAt"),
+        "mergeCommit": pr.get("mergeCommit"),
+        "isMergeQueueEnabled": queue.get("enabled", False),
+        "isInMergeQueue": queue.get("in", False),
+        "mergeQueueEntry": queue.get("entry") if queue.get("in") else None,
+        "timelineItems": {"nodes": queue.get("removed", [])},
+    }
+    print(json.dumps({"data": {"repository": {"pullRequest": node}}}))
+    done()
+'''
+DONE_DEF = 'def done(code=0):\n    json.dump(state, open(path, "w"))\n    sys.exit(code)\n'
+
+
+def with_queue(fake: str) -> str:
+    """A stand-in for `gh` that also answers for the merge queue."""
+    assert DONE_DEF in fake
+    return fake.replace(DONE_DEF, DONE_DEF + QUEUE_FAKE, 1)
+
+
+FAKE_GH = with_queue(FAKE_GH)
+
+
 def allow_exemptions(run_dir, *patterns) -> None:
     """A run created when its repository's spec named these patterns under `exemptable`."""
     path = Path(run_dir) / "run.json"

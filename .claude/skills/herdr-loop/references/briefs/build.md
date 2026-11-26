@@ -67,7 +67,7 @@ Plain facts, no argument for passing. It contains these two lines exactly once e
 **Ready.** URL `<a URL that answers once the build is up>`
 ```
 
-For an item routed with a look, the Serve line must start the real server: an empty line, `true`, `:` or any other no-op is sent back, because a reviewer cannot look at a build that is not running. When nothing is served (an item with no look), write instead:
+For an item routed with a look, {{SERVE_RULE}} When nothing is served (an item with no look), write instead:
 
 ```
 **Serve.** `true`

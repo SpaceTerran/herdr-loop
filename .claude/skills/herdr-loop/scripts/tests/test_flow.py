@@ -13,6 +13,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -238,6 +239,18 @@ class PrepareTest(FlowCase):
         self.assertTrue((worktree / ".deps" / "installed").exists())
         self.assertEqual((self.fields()["setup"], self.fields()["setup_key"]), ("ready", flow.setup_key(worktree, ["requirements.txt", "package-lock.json"])))
         self.assertIn("installing", (self.item_dir() / "setup-1.log").read_text())
+
+    def test_the_repositorys_setup_is_not_given_the_loops_tokens(self):
+        # Its install scripts are the pull request's code, run before any review.
+        self.repo(setup="mkdir -p .deps && env | sed 's/=.*//' > .deps/env")
+        tokens = {name: "secret-for-tests" for name in flow.SETUP_WITHHELD}
+        with mock.patch.dict(os.environ, {**tokens, "HL_TEST_KEPT": "1"}):
+            code, out = self.prepare()
+        self.assertEqual((code, out["setup"]), (0, "ready"))
+        seen = set((Path(self.fields()["worktree"]) / ".deps" / "env").read_text().split())
+        self.assertEqual(seen & set(flow.SETUP_WITHHELD), set())
+        self.assertTrue({"HL_TEST_KEPT", "PATH", "HOME"} <= seen)
+        self.assertTrue({"GH_TOKEN", "GITHUB_TOKEN", "OP_SERVICE_ACCOUNT_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"} <= set(flow.SETUP_WITHHELD))
 
     def test_a_stream_that_needs_none_of_the_repositorys_setup_gets_none(self):
         self.repo(setup="mkdir -p .deps && touch .deps/installed")
@@ -1104,7 +1117,7 @@ class ReviewedTest(FlowCase):
     def test_giving_back_is_not_a_phase_anything_starts(self):
         with self.assertRaises(Refusal) as caught:
             items.start_phase(self.run_dir, "A-1", "give_back", session="s")
-        self.assertEqual(str(caught.exception), "unknown phase 'give_back'; one of agree, build, grade, correction, ci_rerun, verify")
+        self.assertEqual(str(caught.exception), "unknown phase 'give_back'; one of agree, build, grade, correction, ci_rerun, verify, walk")
         for verb in (["start"], ["void", "--note", "x"]):
             with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()) as said:
                 items.main(["--run-dir", str(self.run_dir), *verb, "--id", "A-1", "--phase", "give_back"])
@@ -2258,6 +2271,31 @@ class SaveTest(LedgerCase):
             self.assertEqual(saved.call_args.kwargs["ci_facts"](), {"repos": {}})
         self.assertEqual(read.call_args.kwargs["no_token"], "GH_TOKEN is not set")
 
+    def test_the_answer_says_how_fast_items_merge_and_what_they_cost_and_a_broken_read_never_fails_the_save(self):
+        read = {"window": {"merged": 40}, "merge_wait_minutes": {"median": 21.4, "p90": 104.3, "items": 40}, "errors": []}
+        code, out = flow.save(self.root, self.PID, self.procs, "A-1 merged", velocity_facts=lambda: read)
+        self.assertEqual((code, out["heartbeat"], out["velocity"]), (0, "stamped", read))
+
+        def broken():
+            raise RuntimeError("transcript vanished")
+
+        code, out = flow.save(self.root, self.PID, self.procs, "A-1 merged", velocity_facts=broken)
+        self.assertEqual((code, out["heartbeat"], out["velocity"]), (0, "stamped", {"errors": ["could not be read: transcript vanished"]}))
+        # A save that is given no read answers no such fact.
+        code, out = flow.save(self.root, self.PID, self.procs, "A-1 merged")
+        self.assertNotIn("velocity", out)
+
+    def test_the_command_line_reads_the_velocity_at_every_save_even_without_the_token(self):
+        from hl import velocity
+
+        with mock.patch.object(merge, "require_loop_token", side_effect=Refusal("GH_TOKEN is not set")), mock.patch.object(
+            flow, "save", return_value=(0, {})
+        ) as saved, mock.patch.object(velocity, "facts_or_said", return_value={"window": {"merged": 0}}) as read:
+            with contextlib.redirect_stdout(io.StringIO()):
+                flow.main(["--root", str(self.root), "save", "--pid", str(self.PID), "--note", "x"], procs=self.procs)
+            self.assertEqual(saved.call_args.kwargs["velocity_facts"](), {"window": {"merged": 0}})
+        self.assertEqual(read.call_args.args, (str(self.root),))
+
     def elsewhere(self, name, text):
         """A commit on the ledger branch made from another clone, as the operator would."""
         other = self.tmp / f"operator-{len(list(self.tmp.glob('operator-*')))}"
@@ -2309,6 +2347,58 @@ class SaveTest(LedgerCase):
             out["idle"],
             {"streams": [{"stream": "docs", "since": None, "minutes": None, "pending": 0}, {"stream": "main", "since": "2026-11-07T11:30:00Z", "minutes": 212, "pending": 2}]},
         )
+
+    def test_a_stream_whose_item_passed_and_waits_to_merge_is_listed_with_the_wait(self):
+        # the help-desk catalog program, 2026-11-17: streams held reviewed items about 60 % of the day behind one merge per deploy,
+        # and `idle` counted each as at work because its item was in progress.
+        def attempts(*log):
+            write_json(items.item_dir(self.run_dir, "A-1") / "attempts.json", {**items.load_attempts(self.run_dir, "A-1"), "log": list(log)})
+
+        build = {"phase": "build", "n": 1, "at": "2026-11-17T09:00:00Z"}
+        passed = {"phase": "grade", "n": 1, "at": "2026-11-17T09:30:00Z", "read": {"effective": "PASS", "at": "2026-11-17T10:00:00Z"}}
+        self.assertEqual(items.load_item(self.run_dir, "A-1")["status"], "in_progress")
+        attempts(build, passed)
+        with mock.patch.object(flow, "utc_now", return_value="2026-11-17T11:49:30Z"):
+            idle = self.save("A-1 passed")[1]["idle"]
+        self.assertEqual(idle["streams"][0]["waiting_to_merge"], [{"id": "A-1", "passed": "2026-11-17T10:00:00Z", "minutes": 109}])
+        self.assertEqual((idle["streams"][0]["stream"], idle["streams"][0]["pending"]), ("main", 2))
+        # A rework started after the pass, a review that did not pass, a pass given back, or the merge: not waiting to merge.
+        for log in (
+            [build, passed, {"phase": "build", "n": 2, "at": "2026-11-17T10:30:00Z"}],
+            [build, {**passed, "read": {"effective": "FAIL", "at": "2026-11-17T10:00:00Z"}}],
+            [build, {**passed, "voided": {"given_back": True}}],
+        ):
+            attempts(*log)
+            self.assertEqual(self.save("A-1 at work")[1]["idle"], {"streams": []}, log)
+        attempts(build, passed)
+        write_json(items.item_dir(self.run_dir, "A-1") / "merge.json", {"state": "MERGED", "at": "2026-11-17T12:00:00Z"})
+        self.assertEqual(self.save("A-1 merged")[1]["idle"], {"streams": []})
+
+    def test_a_watched_log_says_how_long_since_it_was_written_and_when_that_is_stale(self):
+        # the help-desk catalog program, 2026-11-14: the sample loader stopped and the program learned of it about 67 hours later.
+        self.assertNotIn("logs", self.save("nothing watched")[1])
+        fresh, old = self.tmp / "fresh.log", self.tmp / "old.log"
+        fresh.write_text("batch 41 done\n")
+        old.write_text("batch 7 done\n")
+        os.utime(old, (time.time() - 3 * 3600, time.time() - 3 * 3600))
+        self.settings(watch_logs=[
+            {"path": str(fresh), "what": "the loader", "stale_minutes": 100},
+            {"path": str(old), "what": "the import", "stale_minutes": 100},
+            {"path": str(self.tmp / "gone.log"), "what": "the sweep", "stale_minutes": 100},
+        ])
+        code, out = self.save("loader running")
+        self.assertEqual(code, 0)
+        logs = {row["what"]: row for row in out["logs"]}
+        self.assertEqual((logs["the loader"]["stale"], logs["the loader"]["minutes"]), (False, 0))
+        self.assertEqual((logs["the import"]["stale"], logs["the import"]["minutes"]), (True, 180))
+        self.assertEqual((logs["the sweep"]["stale"], logs["the sweep"]["minutes"]), (True, None))
+        self.assertIn("FileNotFoundError", logs["the sweep"]["error"])
+
+    def test_a_logs_read_that_breaks_is_said_and_never_fails_the_save(self):
+        self.settings(watch_logs=[{"path": str(self.tmp / "x.log"), "stale_minutes": 100}])
+        with mock.patch.object(flow, "watched_logs", side_effect=RuntimeError("bad entry")):
+            code, out = self.save()
+        self.assertEqual((code, out["heartbeat"], out["logs"]), (0, "stamped", {"errors": ["could not be read: bad entry"]}))
 
     def test_a_run_of_no_stream_is_named_and_never_counted_for_one(self):
         # A run made without `--stream`, or for a stream the program no longer has: its item in progress is nobody's,

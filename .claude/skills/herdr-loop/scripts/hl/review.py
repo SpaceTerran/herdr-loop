@@ -298,6 +298,19 @@ BROWSER_RE = re.compile(r"^mcp__(?:.*_)?playwright(?:_.*)?__(browser_\w+)$")
 BROWSER_PASSIVE = ("browser_resize", "browser_close", "browser_install", "browser_tabs", "browser_console_messages", "browser_network_requests")
 # The browser calls whose `filename` names a script they run; on any other, a `filename` is where the call writes its output.
 BROWSER_SCRIPT_FILE = ("browser_run_code", "browser_run_code_unsafe")
+# What the kit's text-fit check (`references/text-fit.js`) answers, as the browser tool prints it: its counts, which
+# number every kind it reports, and just before them the width of the page it measured. A reviewer's own script that
+# calls the check may keep the counts, with their key or without, and drop the width; the width is then the viewport's.
+# The findings it lists under the same names are lists, never numbers.
+TEXT_FIT_COUNTS_RE = re.compile(r'\{[^{}]*"hard_ellipsis":\s*\d+[^{}]*"short_wrap":\s*\d+[^{}]*\}')
+TEXT_FIT_WIDTH_RE = re.compile(r'"width":\s*(\d+(?:\.\d+)?)\s*,\s*"counts":\s*$')
+# How the browser tool says what it ran when the viewport changes (`browser_resize`, or a script of the reviewer's).
+VIEWPORT_RE = re.compile(r"setViewportSize\(\s*\{\s*width:\s*(\d+)")
+# The viewport every session's browser starts at (`references/mcp-playwright.json`).
+VIEWPORT_WIDTH = 1280
+# The widths a review's text-fit check must have answered at, as the brief's `text-fit` block asks: the narrowest
+# a page is made for (390 or 1024), 1280, and 1440.
+TEXT_FIT_WIDTHS = (("at 1024 or narrower", 0, 1024), ("at 1280", 1025, 1439), ("at 1440 or wider", 1440, float("inf")))
 IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff")
 # The start of a hunk in a patch, with how many lines it removes and adds (one, where git leaves the count out).
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
@@ -860,6 +873,52 @@ def _tool_calls(path: Path):
                 yield str(block.get("name", "")), block.get("input") if isinstance(block.get("input"), dict) else {}
 
 
+def browser_answers(path: Path) -> list[tuple[str, str]]:
+    """What each browser call in a transcript answered, as (the call's
+    action, the text of its result), once for each call that has a
+    result. A transcript can hold one call twice; its id is read once."""
+    calls: dict[str, str] = {}
+    out, answered = [], set()
+    for blocks in _records(path):
+        for block in blocks:
+            if block.get("type") == "tool_use":
+                browser = BROWSER_RE.match(str(block.get("name", "")))
+                if browser and block.get("id"):
+                    calls[str(block["id"])] = browser.group(1)
+            elif block.get("type") == "tool_result":
+                key = str(block.get("tool_use_id", ""))
+                if key in calls and key not in answered:
+                    answered.add(key)
+                    content = block.get("content")
+                    parts = [content] if isinstance(content, str) else [part.get("text") for part in content or [] if isinstance(part, dict)]
+                    out.append((calls[key], "\n".join(str(text or "") for text in parts)))
+    return out
+
+
+def text_fit_widths(transcripts: list[Path]) -> list[int]:
+    """The widths at which the kit's text-fit check answered in a browser
+    call of these transcripts, whatever the call was: the runner a brief
+    names, the file pasted into `browser_evaluate`, or a script of the
+    reviewer's that calls the check. Each answer's width is the one it
+    reports beside its counts, or else the viewport's, as the last call
+    that set it before or in this one did (each session's browser starts
+    at 1280). An answer returned as a JSON string is read the same. A
+    check that failed answered nothing, and a script run from the shell is
+    not a look."""
+    widths = set()
+    for path in transcripts:
+        viewport = VIEWPORT_WIDTH
+        for _action, text in browser_answers(path):
+            sizes = VIEWPORT_RE.findall(text)
+            if sizes:
+                viewport = int(sizes[-1])
+            text = text.replace('\\"', '"')
+            for found in TEXT_FIT_COUNTS_RE.finditer(text):
+                own = TEXT_FIT_WIDTH_RE.search(text[max(0, found.start() - 40) : found.start()])
+                widths.add(round(float(own.group(1))) if own else viewport)
+    return sorted(widths)
+
+
 def session_transcripts(session: str) -> list[Path]:
     """A Claude session's transcript and those of its sub-agents."""
     main = herdr_mod.claude_transcript(session)
@@ -1218,6 +1277,24 @@ def check(run_dir, item_id: str, n: int, tools=None, checkout=None) -> dict:
         else:
             why = f"{len(looks) - len(real)} of the {len(looks)} looks its verdict records cite no picture that exists"
         out["problems"].append(f"this item changes something a person looks at, and the review did not look: {why}")
+    # Text fit, at each width the brief asked for, as the check itself answered in the browser. A brief rendered
+    # before the kit had the check asked nothing of it.
+    out["text_fit_widths"] = text_fit_widths(transcripts)
+    try:
+        asked = "text-fit.js" in (d / f"grade-{n}.brief.md").read_text(errors="replace")
+    except OSError:
+        asked = False
+    missing = [label for label, low, high in TEXT_FIT_WIDTHS if not any(low <= width <= high for width in out["text_fit_widths"])]
+    out["text_fit_skipped"] = missing if look_required and port and asked else []
+    # A run that is `text_fit_widths: recorded` keeps the widths as a record, and the repository's required text-fit
+    # check is the gate: `hl-merge` holds that check among those it holds green before such a review counts.
+    counted = items.option(items.load_run(run_dir), "text_fit_widths") == "counted"
+    if out["text_fit_skipped"] and counted:
+        answered = f"at {', '.join(map(str, out['text_fit_widths']))} px only" if out["text_fit_widths"] else "at no width"
+        out["problems"].append(
+            f"this item changes something a person looks at, and the review's text-fit check answered {answered}, not {' or '.join(missing)}: "
+            "its brief asks for the check at 1280, at 1440 or wider and at 1024 or narrower"
+        )
     missed = [page for page in looked_before if page not in {_page(look) for look in looks if isinstance(look, dict)}]
     if missed:
         shown = ", ".join(f"{path} ({mode})" for mode, path in missed)

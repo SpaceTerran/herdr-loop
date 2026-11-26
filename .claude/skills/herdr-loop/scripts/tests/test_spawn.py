@@ -277,6 +277,21 @@ class ReviewBriefTest(SpawnCase):
         items.save_item(self.run_dir, item)
         items.route_item(self.run_dir, "A-1", "independent", True, "a page")
         self.assertIn("**This item changes something a person looks at.**", self.render())
+        # Every look measures text fit with the kit's script, and nothing of the block is left unfilled.
+        self.assertIn("references/text-fit.js` as the `function` of `browser_evaluate`", self.render())
+        self.assertNotIn("{{", self.render())
+
+    def test_a_reviewer_who_looks_gets_the_text_fit_check_beside_the_item_to_run_from_a_file(self):
+        # @playwright/mcp 0.0.82 runs a script file (`browser_run_code_unsafe`'s `filename`) only from under the
+        # session's own directory ("File access denied: … is outside allowed roots"): HD-1049's reviewer,
+        # the help-desk catalog program, 2026-11-18.
+        items.route_item(self.run_dir, "A-1", "independent", True, "a page")
+        runner = (self.item_dir() / "evidence-1").resolve() / ".playwright-mcp" / "text-fit-run.js"
+        self.assertIn(f"`browser_run_code_unsafe` with `filename` set to `{runner}`", self.render())
+        out = spawn.start(self.root, self.run_dir, "A-1", "grade", "claude", self.herdr, self.opts(phase="grade"), envs=self.envs, sleep=lambda s: None)
+        self.assertEqual(out["cwd"], str(runner.parents[1]))
+        check = (Path(program.load(self.root)["kit"]) / "references" / "text-fit.js").read_text().strip()
+        self.assertEqual(runner.read_text(), f"async (page) => page.evaluate(\n{check}\n)\n")
 
     def test_what_the_checks_run_is_said_when_the_spec_says_it(self):
         text = self.render()
@@ -674,6 +689,74 @@ class StartTest(SpawnCase):
             self.assertTrue(agent["description"].strip() and agent["prompt"].strip(), name)
             for tool in agent["tools"]:
                 self.assertIn(tool, ("Bash", "Read", "Glob", "Grep"), name)
+
+    def cap_context(self, size="150k"):
+        settings = read_json(self.root / "program.json")
+        write_json(self.root / "program.json", {**settings, "builder_autocompact": size})
+
+    def test_without_a_context_cap_a_build_compacts_where_claude_code_does(self):
+        self.start()
+        argv = self.agent_argv()
+        self.assertNotIn("--autocompact", argv)
+        self.assertTrue(argv[argv.index("--settings") + 1].endswith("references/worker-settings.json"))
+        self.assertIsNone(read_json(self.item_dir() / "build-1.worker.json")["autocompact"])
+
+    def test_a_capped_build_compacts_there_and_is_told_to_read_its_brief_again(self):
+        # The velocity review (2026-11-19, change 7): one build in ten passed 300k tokens of context, because nothing
+        # compacted it before about 967k, and 69 % of the builders' context reads happened above 150k.
+        self.cap_context()
+        self.start()
+        argv = self.agent_argv()
+        self.assertEqual(argv[argv.index("--autocompact") + 1], "150k")
+        settings_path = Path(argv[argv.index("--settings") + 1])
+        self.assertEqual(settings_path, self.item_dir() / "build-1.settings.json")
+        settings = read_json(settings_path)
+        self.assertEqual((settings["attribution"], settings["includeCoAuthoredBy"]), ({"commit": "", "pr": ""}, False))
+        hook = settings["hooks"]["SessionStart"][0]
+        self.assertEqual(hook["matcher"], "compact")
+        self.assertNotIn("PreToolUse", settings["hooks"])
+        # What the hook prints is what Claude Code adds to the conversation after the compaction.
+        said = subprocess.run(["sh", "-c", hook["hooks"][0]["command"]], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(said, spawn.reread_brief(self.item_dir() / "build-1.brief.md") + "\n")
+        self.assertIn(f"read your brief again, whole: {self.item_dir() / 'build-1.brief.md'}.", said)
+        self.assertEqual(read_json(self.item_dir() / "build-1.worker.json")["autocompact"], "150k")
+
+    def test_a_capped_rework_compacts_at_the_same_size_and_rereads_its_own_brief(self):
+        self.cap_context()
+        self.start()
+        self.finish_build()
+        self.start("--set", "READY_SUMMARY=answered", phase="grade")
+        argv = self.agent_argv()
+        # A review is not a build: it keeps Claude Code's own window.
+        self.assertNotIn("--autocompact", argv)
+        self.assertTrue(argv[argv.index("--settings") + 1].endswith("references/worker-settings.json"))
+        self.finish_grade()
+        self.start()
+        argv = self.agent_argv()
+        self.assertIn("--resume", argv)
+        self.assertEqual(argv[argv.index("--autocompact") + 1], "150k")
+        hook = read_json(Path(argv[argv.index("--settings") + 1]))["hooks"]["SessionStart"][0]
+        self.assertIn(str(self.item_dir() / "build-2.brief.md"), hook["hooks"][0]["command"])
+
+    def test_with_sub_agents_open_a_capped_build_gets_both_hooks(self):
+        self.open_subagents()
+        self.cap_context()
+        self.start()
+        hooks = read_json(Path(self.agent_argv()[self.agent_argv().index("--settings") + 1]))["hooks"]
+        self.assertEqual((hooks["PreToolUse"][0]["matcher"], hooks["SessionStart"][0]["matcher"]), ("Agent|Task", "compact"))
+
+    def test_a_cursor_build_is_started_as_before_under_a_cap(self):
+        self.cap_context()
+        self.start(engine="cursor")
+        self.assertEqual(self.agent_argv(), ["--force", "--trust", "--approve-mcps", "--sandbox", "disabled", "--model", "composer-2.5[fast=false]"])
+        self.assertIsNone(read_json(self.item_dir() / "build-1.worker.json")["autocompact"])
+
+    def test_a_cap_claude_code_would_refuse_starts_no_worker(self):
+        self.cap_context("99k")
+        with self.assertRaises(Refusal) as caught:
+            self.start()
+        self.assertIn("`builder_autocompact` is a size from 100k to 999k, such as `150k`, or null, got '99k'", str(caught.exception))
+        self.assertEqual(self.attempts()["build"], 0)
 
     def test_a_voided_attempts_settings_file_is_set_aside_with_it(self):
         self.open_subagents()
@@ -1462,9 +1545,9 @@ class ClaudeHomeStartTest(SpawnCase):
 
     def setUp(self):
         super().setUp()
-        self.team = str(self.tmp / "home" / ".claude-team")
+        self.loop_home = str(self.tmp / "home" / ".claude-loop")
         settings = read_json(self.root / "program.json")
-        write_json(self.root / "program.json", {**settings, "worker_claude_ref": "-", "claude_config_dir": self.team})
+        write_json(self.root / "program.json", {**settings, "worker_claude_ref": "-", "claude_config_dir": self.loop_home})
 
     def test_a_claude_worker_starts_on_the_programs_sign_in(self):
         out = self.start()
@@ -1472,7 +1555,7 @@ class ClaudeHomeStartTest(SpawnCase):
         ran = [c[3] for c in self.herdr.called("pane", "run")]
         self.assertEqual(len(ran), 3)
         self.assertIn("hl-env.sh", ran[0])
-        self.assertIn(f"export CLAUDE_CONFIG_DIR={self.team};", ran[1])
+        self.assertIn(f"export CLAUDE_CONFIG_DIR={self.loop_home};", ran[1])
         self.assertIn("export HL_ZDOTDIR=", ran[2])
         order = [c[:2] for c in self.herdr.calls]
         self.assertLess(len(order) - order[::-1].index(("pane", "run")) - 1, order.index(("agent", "start")))
@@ -1480,7 +1563,7 @@ class ClaudeHomeStartTest(SpawnCase):
 
     def test_a_claude_worker_starts_on_the_seat_the_program_moved_to(self):
         other = str(self.tmp / "home" / ".claude-other")
-        write_json(self.root / "program.json", {**read_json(self.root / "program.json"), "claude_seats": [self.team, other]})
+        write_json(self.root / "program.json", {**read_json(self.root / "program.json"), "claude_seats": [self.loop_home, other]})
         write_json(self.root / "seat.json", {"home": other})
         self.assertTrue(self.start()["started"])
         ran = [c[3] for c in self.herdr.called("pane", "run")]
@@ -1495,7 +1578,7 @@ class ClaudeHomeStartTest(SpawnCase):
         self.assertEqual((self.herdr.tab_panes(), self.attempts()["build"]), ({}, 0))
 
     def test_a_sign_in_that_does_not_load_starts_no_worker_and_gives_the_attempt_back(self):
-        self.herdr.home_say = f"hl-home FAILED {{nonce}}: no Claude sign-in in {self.team}"
+        self.herdr.home_say = f"hl-home FAILED {{nonce}}: no Claude sign-in in {self.loop_home}"
         with self.assertRaises(Refusal) as caught:
             self.start()
         self.assertIn("sign-in did not load", str(caught.exception))

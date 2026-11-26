@@ -19,6 +19,8 @@ An item becomes one brief, carried out in one unattended session, then reviewed 
 
 **Floor.** look: every product shares this page.
 
+**Origin.** new
+
 **Verify.** `<one command that exits 0 once the merge has deployed>`
 Wait. 15
 ```
@@ -27,6 +29,13 @@ Wait. 15
 - `**Scope.**` and `**Accept.**` are required. `**Accept.**` is one unbroken block of lines `N. text`, at most ten; a blank line ends it. Commands go inline in backticks.
 - `**Depends.**` names ids of the same run. An ordering between files is a gate in the spec. Either one names the output it needs from what it waits on ("Nothing waits to see whether it fixes itself", below).
 - `**Verify.**` is one line: one command in backticks with no backtick inside it, then optionally `Wait. <minutes>` (1 to 60, default 15). The wait is a deadline counted from the merge, not a soak: the loop runs the command as soon and as often as needed and records a failure only when the deadline passes. Write a command that fails until the deploy has landed and then passes.
+- **A Verify line reads the deploy that carries the merge, not the merge's own run.** A deploy workflow with a `concurrency` group keeps one run going and one pending, so when merges come close together the middle run is cancelled and the next one deploys the base's head, which carries the cancelled commit. A line that waits on the merge commit's own run (`gh run list --commit "$sha"`) can then never pass, and a program that learns this starts merging one item per deploy: on the help-desk catalog program (2026-11-15 to 11-17) the median wait from a passed review to its merge went from 10 to 109 minutes. Select the newest successful push run of the deploy workflow on the base whose head has the merge commit as an ancestor, then check what is live:
+
+  ```
+  sha=${HL_MERGE_SHA}; ok=; for i in $(seq 1 120); do git fetch -q origin main; for h in $(gh run list --repo <owner/name> --workflow <apply.yml> --branch main --event push --status success -L 30 --json headSha --jq '.[].headSha'); do git merge-base --is-ancestor "$sha" "$h" 2>/dev/null && { ok=$h; break; }; done; [ -n "$ok" ] && break; sleep 30; done; test -n "$ok" && <the item's live checks>
+  ```
+
+  It is run in the stream's clone, which has the base's history. A failed run of that workflow is still a red deploy, read before every merge; this shape only stops a cancelled one from being taken for a failure.
 - Text above the first heading reaches no worker.
 
 ## Accept lists hold behaviour
@@ -46,6 +55,24 @@ What does belong:
 - **A browser observation with one value**, at a 1280×800 viewport, as an expression: "at `/app/alerts`, `getComputedStyle(document.querySelector('[data-testid=\"…\"]')).backgroundColor` is `rgb(20, 17, 28)`". Where color matters, one for each mode.
 - **The reference.** An item that changes what a person sees names the reference page or file it is to match, and the modes. The reviewer compares the served page with it in every mode named, measured values and the whole page by eye. Do not pin every pixel in criteria; name the reference.
 - A value the item pins for something the build will produce (a hash, a count) is the item's: say how it was produced.
+
+## A criterion that text fits says how much room it has
+
+Every look runs the kit's text-fit check at 1280, at 1440 and at the narrowest width a page is made for, with data as long as real data. A criterion that asks for text to show whole at a width is one the check will hold the item to, so measure before you write it: serve the page, and set the longest real value against the box it goes in, at each width the criterion names (the face's size times the characters, or the rendered width, against the room the layout leaves).
+
+- **State both numbers in the criterion.** "At 390, the 49-character name needs 383.5 px at 13 px; the page leaves the field at most 358 px." A reader can then see whether it can pass before anything is built.
+- **Where the longest value cannot fit, say what is allowed instead:** a wrap onto a second line, or an ellipsis that leaves at least 7 characters (the check's `hard_ellipsis` reports fewer). A criterion that asks for it whole anyway cannot pass, and the build fails on the criterion, not the change.
+- **Write a criterion only for room the item can make.** If the room is set by something outside the item's paths (the page shell's padding, a bar whose other buttons the item may not touch), the item cannot change it: say so, and narrow the criterion to the widths where it fits.
+
+On the help-desk catalog program (2026-11-18) three items failed on criteria like these, and two were rebuilt as repair items. One asked for a 49-character name whole at 390: 383.5 px at 13 px against at most 358 px of page, set by the shell's padding. Another asked for a 61-character name whole on one line at 1280, where the bar held 1391 px of content against 1248. The third's allowance for an ellipsis at 390 lay outside the item's paths, so no build could turn the required check green. Each is recorded among the program's Decisions.
+
+## The paths an item may write
+
+The Scope names them. They tell the builder where to work and where another stream is working, and they are a note, not a result: what the build had to touch beyond them is something whoever writes the next items should know.
+
+- **Where the program is `write_list: note`** (in `program.json`, from the spec's `settings`), write no Accept line that only limits the paths (`` `git diff --name-only origin/main...HEAD` lists only paths this item may write ``). The contract's drafter leaves such a line out, and a reviewer marks one already in a contract `checks` and names each path the build wrote outside the Scope's in a finding with `criterion: null`, which nothing is corrected for. On the help-desk catalog program, in the week to 2026-11-19, 15 of the 62 reviews that did not pass did not pass on such a line, where the build had needed one more path (a test the change broke, a registry the new file joins), and each went to a correction and a second review.
+- **Where it is `criterion`** (the default), such a line is a criterion like any other.
+- **Either way**, the paths no item may change are the spec's `protected` list, held at the merge, and a program's own path rules in its guide stay as they are.
 
 ## Name the tests the change breaks
 
@@ -72,6 +99,23 @@ An item's author knows things the manager cannot see from the text. A floor says
 
 Words after the colon are for people. Without a floor the manager routes the item from its text.
 
+## Origin
+
+An item may say where it came from, in one line written with it:
+
+```
+**Origin.** repair: HD-1102, its empty state
+```
+
+| Origin | Says | For |
+|---|---|---|
+| `new` | nothing more, or a few words | work nobody has built before |
+| `repair: <id>` | the id of the item whose merged work it repairs | a defect found after a merge, by a deploy check, a later item or a person |
+| `audit: <which>` | the audit that found it | a finding of an audit, the closing audit of a file among them |
+| `rule: <which>` | the rule, decision or setting it follows | work made by a change to a rule, not by a defect or a want |
+
+`hl-flow save` counts them (`velocity.origins`): the merged items by origin, and the repairs and audit findings written since the oldest of the last 40 merges, per 100 merged. That is how much of the program is repair, and how many defects reach a merge before anyone sees them. A line that names no kind of these, or a repair that names no item id, is refused when the file is read. An item without the line is counted as `unrecorded`, and a program whose new items say nothing reads as unmeasured. With `item_origin: required` in the spec's settings, a file with an item that has no line is refused when its run is made. It is off by default: an origin is a record and catches no defect, so it has no catch count (`SKILL.md`, "Rules for anyone changing the kit"), and a program turns it on only with the removal of another rule or on the operator's word.
+
 ## Size
 
 An item pays a fixed cost whatever its size: a worktree, a brief, a pull request, a round of required checks, a review, a merge, a deploy check. In the first program a builder's own time on an item was a few minutes of a half-hour total. So do not cut work thin. Two changes that share their files, their reference and their review belong in one item. Keep an item to one coherent change that one review can hold: a page and its own components, not "and also". A larger item puts more at risk in a failed review; where two parts could fail independently and neither needs the other, they are two items.
@@ -83,7 +127,7 @@ An item pays a fixed cost whatever its size: a worktree, a brief, a pull request
 | Fact | What it is | Who uses it |
 |---|---|---|
 | `facts` | sentences every worker in the repository is told: a tool version CI uses that the host does not, a quirk of the test setup, a condition of the test host that is known and is not a finding | every brief |
-| `setup` | one command line that makes a fresh checkout ready, writing only paths git ignores | `hl-flow prepare` runs it before any worker starts, and again before a review when an input changed |
+| `setup` | one command line that makes a fresh checkout ready, writing only paths git ignores, and needing none of the loop's tokens | `hl-flow prepare` runs it before any worker starts, and again before a review when an input changed, without `GH_TOKEN`, the 1Password tokens or the model keys (`hl/flow.py` `SETUP_WITHHELD`): it installs what the item's pull request may have added, before any review |
 | `setup_inputs` | the files that command's result depends on (lockfiles, requirement files) | the same |
 | `ci_covers` | what each required check runs | the review brief: the reviewer does not run those again |
 | `not_in_ci` | suites no required check runs, as commands | the review brief: where the diff touches what one covers, the reviewer runs that part |
@@ -91,12 +135,15 @@ An item pays a fixed cost whatever its size: a worktree, a brief, a pull request
 | `protected` | glob patterns of the paths no item may change (generated or pinned files; a repository whose workflow is generated from a central template lists that workflow, such as `.github/workflows/CICD.yml`) | a pull request that changes one is sent back to its builder, and refused at the merge, unless the manager exempted that one file for that one item (`hl-items exempt`), which only `exemptable` allows |
 | `exemptable` | glob patterns of the protected paths the manager may exempt for one item (`hl-items exempt`); left out, none may be. Name as few as the program needs: `.github/workflows/CICD.yml` belongs here only if an item of the program exists to change it | fixed into each run when it is created; `hl-items exempt` refuses a path outside it, and `hl-merge` counts no exemption outside it |
 | `reference` | one directory of the repository holding the pages a look is compared with (`brand`), as a relative path | `hl-serve` serves that directory of the item's checkout beside the build of an item a person looks at, and the reviewer is told its address: the browser tool refuses `file://`, so without it a reference is read as source |
+| `serve` | `{"command": "<one command line that starts the server on {port}>", "ready": "<a URL on {port} that answers once it is up>"}`, such as `{"command": "npm run start -- --port {port}", "ready": "http://127.0.0.1:{port}/"}` | an item routed with a look whose build report's Serve line starts nothing is served with it, on the item's port, and not sent back to its builder (`hl-merge --after-build`, `hl-serve`); the builder's brief says so, and the reviewer is told. A line that starts nothing and then something more (`echo starting; npm run dev`) is still sent back. On the help-desk catalog program ten rebuilds in the week to 2026-11-19 changed only those two lines |
+| `text_fit_check` | the name of the repository's required check that runs the text-fit check on every page at every width, as GitHub names it among the base's required checks | a program that is `text_fit_widths: recorded` needs it for every repository it works (staging refuses one without it), and `hl-merge` merges an item whose review skipped a width only while that check is among the checks it holds green |
+| `merge_queue` | `true`, or left out. Set it only once the base's ruleset has a merge queue that requires the repository's required checks, and the base's branch protection no longer requires branches to be up to date (the queue tests each pull request on the latest base itself). Set it as soon as the queue is on, with no `hl-merge` between: without it, `hl-merge` merges with `gh pr merge`, against a base that requires the queue. Staging refuses any other value, and refuses it beside `train` | `hl-merge` puts each item's pull request, and each outside one, into the base's merge queue at the head the gate read, in place of merging it, and refuses where GitHub says the base has no queue. `hl-wait --queue <ID>` (or `--queue-outside <PR>`) says when the queue has merged it or taken it out, and `hl-merge` run again records the merge or says why it was taken out. The merge commit's message is the one the repository's squash settings give, not the kit's grade line. Left out, a merge is as it always was |
 | `rewrites` | glob patterns of the tracked paths the repository's own setup or served build rewrites by itself (a lockfile an install touches, `next-env.d.ts`); none unless you know one; a pattern that matches every path is refused at staging | `hl-flow review`: a review starts over such a file and notes it, and over no other tracked file that differs from the commit |
 
 | `train` | `{}` or `{"batch": 5, "limit": 15}`: the repository's items merge into an integration branch on their review, and its required checks run on batches of them (below) | `hl-items init`, `hl-merge`, `hl-train` |
 | `item_checks` | with a train: names of the quick checks an item's own pull request must still show green; may be left out | `hl-merge`, `hl-wait --checks` |
 
-`settings` in the spec replaces a program's defaults (`program.template.json`). `subagents` is `false` there: sub-agents are not proven on the mini (one ran in the background although the guard asks for the foreground), so turn them on only for a program that is there to prove them. One that depends on these facts: `"confirm": "delta"` lets a small fix after a failed review be confirmed by a fresh reviewer against that review's fix list, in place of a second full review. `seen` and `protected` then decide more: a fix that touches a `protected` path, or a `seen` path the failed review did not look at, gets the full review. Leave it out for a second full review every time.
+`settings` in the spec replaces a program's defaults (`program.template.json`). `subagents` is `false` there: sub-agents are not proven on the mini (one ran in the background although the guard asks for the foreground), so turn them on only for a program that is there to prove them. One that depends on these facts: `"confirm": "delta"` lets a small fix after a failed review be confirmed by a fresh reviewer against that review's fix list, in place of a second full review. `seen` and `protected` then decide more: a fix that touches a `protected` path, or a `seen` path the failed review did not look at, gets the full review. Leave it out for a second full review every time. `"confirm_red_checks": "delta"` beside it gives the same confirm to a fix after a review that passed and whose required checks then came out red on that commit: it answers those checks, and the checks run again before anything merges. `write_list` (`criterion` or `note`, above) and `text_fit_widths` (`counted`, the default: a review of a look whose text-fit check did not answer at every width its brief asks for does not count; `recorded`: the widths are recorded and the repository's required text-fit check, named as its `text_fit_check`, is the gate) each loosen one rule a review is held to, for runs made after they are set. `closing_audit` is `contract` by default: the closing audit of a completed file reads each merged item against its contract and the code. With `pages`, the manager also starts a worker that walks the pages the file changed (`hl-spawn start --phase walk`), served on the program's host from the file's last merge as the repository's `setup`, `serve` and `facts` say, with data as long as real data put only into a store the served product holds itself; its defects become repair items that say `**Origin.** audit` ("Origin"). Give such a repository the facts a person would need to serve it on a laptop: each server and its command, how a page is reached, how each colour mode is turned on, and which ports are never used. `wait_delivery` is `task` by default: a wait runs as a background task of the manager's shell, and the manager reads its output back. With `prompt`, the manager starts each wait detached with `hl-wait --deliver`, and the event comes to it as its next message. `builder_autocompact` (`null` in the template) is the window a Claude build's conversation is compacted against, such as `180k` (100k to 999k): the build is launched with `--autocompact` at that size, and a hook has it read its brief again after each compaction. Claude Code compacts some 30k to 40k below the window, not at it (at 119k-121k of context with `150k`, measured), so a program that wants builds compacted near 150k sets about `180k` and reads `velocity.builds.peak_context_p90` to see where they land. Left `null`, Claude Code compacts at about 967k on a 1M model, which few builds reach.
 
 **Nothing may rewrite a tracked file while a review runs.** A review is read against its checkout as it was when its reviewer started. A tracked file that changes after that (a lockfile an install rewrites, generated code, `next-env.d.ts`), or that the served build writes as it is stopped, makes a pass there not count. The reviewer cannot put back what the build writes as it stops. The first such pass of an item is given back and reviewed again; the second parks the item for the operator, and nothing lifts that at the merge. A file the setup or the served build rewrites before the reviewer starts stops the review before it begins, and the build goes back to its builder, unless the spec names the path under `rewrites`. Name a path there only when the rewrite is harmless: the build under review is then not exactly the commit, and after a failed review the builder has to put the file back before its rework is accepted. In every case the cure is in the repository, as an item of its own before the program starts: stop tracking the file (`git rm --cached <path>`) and ignore it.
 
@@ -108,7 +155,7 @@ A stream with `port_base` gets each item's port worked out (the base plus the it
 
 Every item pays for a round of the repository's checks and for its deploy, and a program merges dozens of items: twenty minutes of checks is more than a day of a program's time. CI also grows with every item, a little each time. On the help-desk program its required CI check took 9 minutes on 2026-10-23 and 64 on 2026-11-02, and items went from about an hour to two and a half, before anyone asked why. So before staging, for each repository the program works:
 
-- **Where the jobs run.** In the author's organisation, tests, checks and plans run on a self-hosted fleet (`runs-on: [self-hosted, <label>]`), and only applies and deploys stay on GitHub's hosted runners (a mobile app backend's split since 2026-07-29). A job on `ubuntu-latest` spends the organisation's included Actions minutes, and once those are spent a hosted job fails in seconds with no steps. Two repositories of the help-desk program were still on hosted runners until 2026-11-02 and used most of October's minutes.
+- **Where the jobs run.** Put a repository's jobs on your own self-hosted runners where you have them (`runs-on: [self-hosted, <label>]`), and say in the spec which ones must stay on GitHub's hosted runners. A private repository's job on `ubuntu-latest` spends the account's included Actions minutes, and once those are spent a hosted job fails in seconds with no steps: in one month, two repositories left on hosted runners used most of them.
 - **How long the checks take**, every check a pull request runs and not only the required ones, from the last few merged pull requests, and which check is the slowest.
 - **Whether the suite runs in parallel** (`pytest-xdist`, Vitest's threads). A suite that runs one test at a time grows in time with every test an item adds.
 - **Whether the deploy runs the suite again.** With "require branches to be up to date before merging" on the base, the tree that merges is the tree the pull request's checks passed, and the deploy needs only its build and a health check.

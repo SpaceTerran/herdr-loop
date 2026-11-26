@@ -28,6 +28,13 @@ settings, hooks or plugins, and only the MCP servers its role names. A
 Cursor worker is launched with the operator's own flags and cannot be
 restricted this way.
 
+The page walk of a completed file (`closing_audit: pages`) is a worker too,
+phase `walk` of the file's last merged item. It is an evaluator with a
+browser, in a tab of its own, so a hand-over of the manager does not end
+it. The kit checks out the commit that holds the whole file in the
+worker's own directory and keeps its browser to what it serves on this
+host; `close` stops what it left running and removes that checkout.
+
 Only panes this script opened are ever closed, and only after checking the
 pane still holds the shell that was started in it. Closing the pane does not
 end what a worker's shell commands left in the background: those keep the
@@ -44,13 +51,15 @@ import os
 import re
 import secrets
 import shlex
+import shutil
+import socket
 import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
 
-from . import claim, confirm, contractfmt, herdr as herdr_mod, items, merge, program, reap, review, secrets as keeper, verdict
+from . import claim, confirm, contractfmt, herdr as herdr_mod, items, merge, program, reap, review, secrets as keeper, verdict, verify
 from .common import Refusal, absolute, emit, read_json, sha256_text, utc_now, write_json, write_text
 from .herdr import Herdr, HerdrError
 
@@ -77,6 +86,8 @@ PHASES = {
     "build": ("builder", "b", "build.md"),
     "grade": ("evaluator", "g", "grade.md"),
     "correction": ("evaluator", "c", "correction.md"),
+    # The page walk of a completed file (`closing_audit: pages`), on the file's last merged item.
+    "walk": ("evaluator", "w", "walk.md"),
 }
 TOOLS = {"builder": "Bash,Read,Edit,Write,Glob,Grep", "evaluator": "Bash,Read,Glob,Grep,Write"}
 # The tool that hands work to a sub-agent. Claude Code lists it as `Task` and calls it `Agent`; the hook matches both.
@@ -126,6 +137,198 @@ def _phase(phase: str) -> tuple[str, str, str]:
     if phase not in PHASES:
         raise Refusal(f"unknown phase {phase!r}; one of {', '.join(PHASES)}")
     return PHASES[phase]
+
+
+def worker_dir(d: Path, phase: str, n: int, fields: dict) -> Path | None:
+    """Where a worker runs unless it is told otherwise (`--cwd`). An
+    evaluator works beside the item, never in the repository: what it and
+    its browser write must not show up in the builder's worktree. A builder
+    works in the item's worktree, None while none is recorded."""
+    if _phase(phase)[0] == "evaluator":
+        return (d / (f"evidence-{n}" if phase == "grade" else f"{phase}-{n}.work")).resolve()
+    return Path(fields["worktree"]).resolve() if fields.get("worktree") else None
+
+
+# What the page walk's browser may reach: the servers it starts on this host, on any port. `--allowed-origins` alone
+# let a redirect to another origin, a request rewritten with `page.route` and `page.request` go there (`@playwright/mcp`
+# 0.0.82, tried); a proxy that answers nothing, which only the loopback names bypass, holds all three, and local pages
+# still load. `<-loopback>` takes away Chromium's own bypass, which also covers link-local addresses (169.254/16), so
+# that only the names after it go direct. Nothing may listen on the proxy's port: `walk_problem` refuses a walk while
+# something does. Something that began to listen there later would be sent the browser's other requests, and would
+# have to be an HTTP proxy to pass them on: the limit is against a page or a walker's slip, not against the host.
+WALK_PROXY = ("127.0.0.1", 9)
+WALK_BROWSER_ARGS = (
+    "--allowed-origins",
+    "http://127.0.0.1:*;http://localhost:*",
+    "--proxy-server",
+    f"http://{WALK_PROXY[0]}:{WALK_PROXY[1]}",
+    "--proxy-bypass",
+    "<-loopback>,127.0.0.1,localhost",
+)
+# What the kit fills in a walk's brief from what it checks out: never taken from `--set`.
+WALK_VALUES = ("WALK_COMMIT", "WALK_CHECKOUT", "WALK_SETUP", "WALK_SERVE")
+
+
+def walk_checkout(d: Path, n: int) -> Path:
+    """Where a page walk's commit is checked out: in the walk's own directory, so that it goes with the attempt."""
+    return worker_dir(d, "walk", n, {}) / "checkout"
+
+
+def walk_commit(run_dir, item_id: str) -> str | None:
+    """The commit that brought the item to the base (`verify.landed`): on a train the promoted commit, None until
+    then. A walk serves its file's last one (`walk_tip`), which holds every item of the file."""
+    run, item = items.load_run(run_dir), items.load_item(run_dir, item_id)
+    return verify.landed(run, item, items.item_dir(run_dir, item_id))["base_sha"]
+
+
+def stream_clone(cfg: dict, run: dict) -> Path | None:
+    """The run's stream's clone of its repository, as staging recorded it."""
+    clone = ((cfg.get("streams") or {}).get(run.get("stream") or "") or {}).get("clone")
+    return Path(clone) if clone else None
+
+
+def _listening(host: str, port: int) -> bool:
+    with socket.socket() as probe:
+        probe.settimeout(1)
+        return probe.connect_ex((host, port)) == 0
+
+
+def walk_commits(run_dir) -> dict[str, str | None]:
+    """Each merged item of the run's file, with the commit that brought it to the base."""
+    run = items.load_run(run_dir)
+    return {i: walk_commit(run_dir, i) for i in run["order"] if items.load_item(run_dir, i)["status"] == "merged"}
+
+
+def open_walks(run_dir) -> list[str]:
+    """The run's page walks that are still open, as `<item>/<worker record>`."""
+    return [f"{i}/{name}" for i in items.load_run(run_dir)["order"] for name in _open_workers(run_dir, i) if name.startswith("walk-")]
+
+
+def walk_problem(cfg: dict, run_dir, item_id: str) -> str | None:
+    """Why no page walk of the run's file can start now, or None. Read before anything is counted. Which item the
+    walk starts on is git's to say, once every merge's commit is in the clone (`walk_tip`)."""
+    if program.closing_audit(cfg) != "pages":
+        return "a page walk is for a program whose closing audit walks the pages (`closing_audit: pages`); this one's reads the contracts"
+    run = items.load_run(run_dir)
+    records = {i: items.load_item(run_dir, i) for i in run["order"]}
+    open_items = [i for i, item in records.items() if item["status"] not in items.TERMINAL]
+    if open_items:
+        return f"the file is not complete ({', '.join(open_items[:5])}{' and more' if len(open_items) > 5 else ''} still open): its pages are walked once every item is settled"
+    commits = walk_commits(run_dir)
+    if not commits:
+        return "no item of the file has merged, so there is nothing to walk"
+    lacking = [i for i, sha in commits.items() if not sha]
+    if lacking and items.on_train(run):
+        return f"{', '.join(lacking)} {'is' if len(lacking) == 1 else 'are'} merged into the train and the batch has not been promoted: the walk serves what reached `{cfg['base']}`"
+    if lacking:
+        return f"no merge commit of {', '.join(lacking)} is on record (`merge_sha` in its merge.json), so no commit can be shown to hold the whole file"
+    if not stream_clone(cfg, run):
+        return f"program.json names no clone for the run's stream {run.get('stream')!r}"
+    walking = open_walks(run_dir)
+    if walking:
+        # An item set aside and taken up again can merge after the walk began, and become the file's last.
+        return f"a page walk of the file is open ({', '.join(walking)}): one runs at a time. Read it and close it (`hl-spawn close`) first"
+    if _listening(*WALK_PROXY):
+        return f"something listens on {WALK_PROXY[0]}:{WALK_PROXY[1]}, the port the walk's browser is sent to for every other site: the browser would reach it"
+    return None
+
+
+def walk_tip(tools, clone: Path, commits: dict[str, str], merged_at: dict[str, str]) -> str:
+    """The item whose commit holds every other merged item's: the one a walk starts on. A merge is recorded when
+    `hl-merge` sees it, not when GitHub made it, so `merged_at` is not the base's order (a merge seen late is recorded
+    last with an older commit); git's history is. Items that share their commit (a train's batch) go by `merged_at`."""
+
+    def within(older: str, newer: str) -> bool:
+        if older == newer:
+            return True
+        asked = tools.git(["merge-base", "--is-ancestor", older, newer], clone, check=False)
+        if asked.returncode not in (0, 1):
+            raise Refusal(f"git could not say whether {older} is in {newer}: {' '.join(asked.stderr.split())[:200]}")
+        return asked.returncode == 0
+
+    order = sorted(commits, key=lambda i: str(merged_at.get(i) or ""))
+    tip = order[0]
+    for i in order[1:]:
+        if within(commits[tip], commits[i]):
+            tip = i
+    apart = [i for i in order if not within(commits[i], commits[tip])]
+    if apart:
+        raise Refusal(
+            f"no merge commit of the file holds all of it: {', '.join(apart)} {'is' if len(apart) == 1 else 'are'} not in {tip}'s {commits[tip]}, "
+            "so the merges are not on one line of the base. Say so in the ledger; the file's pages are not walked"
+        )
+    return tip
+
+
+def walk_browser(cfg: dict) -> dict:
+    """The page walk's MCP configuration: the evaluators' own browser server (`mcp-playwright.json`), so that there is
+    one browser to keep current, with `WALK_BROWSER_ARGS` after its own arguments."""
+    source = Path(cfg["kit"]) / "references" / "mcp-playwright.json"
+    try:
+        config = read_json(source)
+        server = config["mcpServers"]["playwright"]
+        if not isinstance(server, dict) or not isinstance(server.get("args"), list):
+            raise TypeError("`mcpServers.playwright` must be an object with an `args` list")
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise Refusal(f"the page walk's browser is the one in {source}, which could not be read as a server with arguments: {error!r}") from error
+    server["args"] = [*server["args"], *WALK_BROWSER_ARGS]
+    return config
+
+
+def _walk_fetch(root: Path, clone: Path, commits: list[str], base: str, tools) -> None:
+    """Have the file's merge commits in the clone: the base holds them, and is fetched on the loop's own token when
+    one is missing."""
+
+    def missing(git_tools) -> list[str]:
+        return [c for c in commits if git_tools.git(["cat-file", "-e", f"{c}^{{commit}}"], clone, check=False).returncode != 0]
+
+    if not missing(tools):
+        return
+    merge.require_loop_token(root)
+    fetcher = pinned_tools(root)
+    fetched = fetcher.git(["fetch", "origin", f"+refs/heads/{base}:refs/remotes/origin/{base}"], clone, check=False)
+    if fetched.returncode != 0:
+        raise Refusal(f"{', '.join(missing(tools))} not in {clone}, and `{base}` could not be fetched there: {' '.join(fetched.stderr.split())[:200]}")
+    still = missing(fetcher)
+    if still:
+        raise Refusal(f"{', '.join(still)} not in {clone}, even with `{base}` fetched")
+
+
+def _make_walk_checkout(tools, walk: dict) -> None:
+    clone, checkout = Path(walk["clone"]), Path(walk["checkout"])
+    tools.git(["worktree", "prune"], clone, check=False)
+    made = tools.git(["worktree", "add", "--detach", str(checkout), walk["commit"]], clone, check=False)
+    if made.returncode != 0:
+        raise Refusal(f"could not check out {walk['commit']} at {checkout}: {' '.join(made.stderr.split())[:200]}")
+
+
+def remove_walk_checkout(tools, walk: dict) -> str | None:
+    """Remove a page walk's checkout from its clone, and say what went wrong, or None."""
+    checkout, clone = Path(walk["checkout"]), Path(walk["clone"])
+    if not clone.is_dir():
+        # No clone, no worktree of it to unregister: the checkout is the walk's own directory's, and goes.
+        shutil.rmtree(checkout, ignore_errors=True)
+        return f"its clone {clone} is gone, so its checkout was deleted as a directory" + (f", and {checkout} is still there" if checkout.exists() else "")
+    problem = None
+    if checkout.exists():
+        removed = tools.git(["worktree", "remove", "--force", str(checkout)], clone, check=False)
+        if removed.returncode != 0:
+            problem = f"its checkout {checkout} could not be removed: {' '.join(removed.stderr.split())[:200]}"
+    tools.git(["worktree", "prune"], clone, check=False)
+    return problem
+
+
+# The browser tool reads a script it runs from a file (`browser_run_code_unsafe`'s `filename`) only under the
+# worker's own directory; this one under it is the browser tool's, and every clone the kit stages ignores it.
+TEXT_FIT_RUN = Path(".playwright-mcp") / "text-fit-run.js"
+
+
+def text_fit_run_text(kit) -> str:
+    """The kit's text-fit check as a script the browser tool runs from a
+    file in one call: `references/text-fit.js` itself, evaluated in the
+    page. Made from that file each time, so there is one check."""
+    check = (Path(kit) / "references" / "text-fit.js").read_text().strip()
+    return f"async (page) => page.evaluate(\n{check}\n)\n"
 
 
 # ---------------------------------------------------------------- brief
@@ -188,18 +391,36 @@ def how_run_of(serve: str, ready_kind: str, ready: str) -> str:
     return sha256_text(json.dumps({"serve": serve, "ready_kind": ready_kind, "ready": ready}, sort_keys=True))
 
 
-def served_as(run_dir, item_id: str) -> str | None:
+def served_as(run_dir, item_id: str, cfg: dict | None) -> str | None:
     """The same value from the Serve and Ready lines of the item's latest
-    build report, or None where the report does not say. For a brief
+    build report (or the repository's own serve command where they start
+    nothing: `serving`), or None where the report does not say. For a brief
     rendered before anything is served (`hl-spawn brief`): what a review is
     started with is what was served, and a report can be rewritten once
     its build is running."""
+    how = serving(run_dir, item_id, cfg)
+    return how_run_of(how["serve"], how["ready_kind"], how["ready"]) if how else None
+
+
+def serving(run_dir, item_id: str, cfg: dict | None) -> dict | None:
+    """How the item's latest build is served, as `hl-serve` serves it, or None where its report does not say.
+    `cfg` is the program's settings, which name the repository's serve command; it is asked for, so that no caller
+    leaves it out by accident and gets another value than `hl-serve` served. None (tests only): the report's lines."""
     report = items.item_dir(run_dir, item_id) / f"build-{items.load_attempts(run_dir, item_id)['build']}.md"
     try:
         how = contractfmt.how_to_run(report.read_text())
     except (OSError, contractfmt.ContractError):
         return None
-    return how_run_of(how["serve"], how["ready_kind"], how["ready"])
+    item = items.load_item(run_dir, item_id)
+    default = program.repo_facts(cfg, items.load_run(run_dir)["repo"]).get("serve") if cfg else None
+    return contractfmt.serving(how, bool((item.get("route") or {}).get("look")), default, item["fields"].get("port"))
+
+
+def walk_git(root) -> merge.Tools:
+    """The program's pinned git, checked to be the file that was pinned: all
+    that removing a page walk's checkout needs."""
+    # Removing a checkout never calls gh; `Tools` takes a name for it all the same.
+    return merge.Tools(git=claim.check_pins(root, ("git",))["bins"]["git"], gh="gh")
 
 
 def pinned_tools(root) -> merge.Tools:
@@ -274,7 +495,7 @@ def _builder_values(cfg: dict, run: dict, item: dict, values: dict, engine: str 
         out["TESTING"] = blocks["testing-touched" if cfg.get("prepush") == "touched" else "testing-full"]
     route = item.get("route")
     if (route or {}).get("look") or "look" in (item.get("floor") or []):
-        out["LOOK"] = blocks["look-builder" if claude else "look-builder-none"]
+        out["LOOK"] = _fill(blocks["look-builder" if claude else "look-builder-none"], values)
     else:
         out["LOOK"] = blocks["no-look-builder" if route else "look-builder-unknown"]
     out["HELPERS"] = blocks["helpers" if claude and cfg.get("subagents") else "no-helpers"]
@@ -326,18 +547,24 @@ def _dispute_text(d: Path, attempts: dict, grades: list[dict], criterion: str | 
     return " ".join(p for p in parts if p)
 
 
-def _confirm_values(cfg: dict, run: dict, values: dict, plan: dict) -> dict:
-    """What a delta confirm's brief carries: the fix list it answers, the
-    two commits the fix lies between, what the fix touches, and the pages
-    the failed review looked at."""
+def _confirm_values(cfg: dict, run: dict, d: Path, values: dict, plan: dict) -> dict:
+    """What a delta confirm's brief carries: the fix list it answers (or,
+    for a fix for red checks, the checks), the two commits the fix lies
+    between, what the fix touches, and the pages the failed review looked at."""
     blocks = brief_blocks(cfg)
     # A reviewer's words go into the brief as text: on one line, and never as a placeholder of the brief's own.
     plain = lambda text: " ".join(str(text or "").split()).replace("{{", "{ {")  # noqa: E731
     entries = []
-    for k, fix in enumerate(plan["fix_list"], 1):
-        about = f"Criterion {fix['criterion']}" if fix.get("criterion") is not None else "No criterion"
-        where = f" (`{plain(fix['where'])}`)" if fix.get("where") else ""
-        entries.append(f"  {k}. {about}: {plain(fix.get('what'))}{where}")
+    red = plan.get("red_checks")
+    if red is not None:
+        for k, check in enumerate(red, 1):
+            link = f" {plain(check['link'])}" if check.get("link") else ""
+            entries.append(f"  {k}. Required check `{plain(check['name'])}`: {plain(check.get('bucket')) or 'not green'}.{link}")
+    else:
+        for k, fix in enumerate(plan["fix_list"], 1):
+            about = f"Criterion {fix['criterion']}" if fix.get("criterion") is not None else "No criterion"
+            where = f" (`{plain(fix['where'])}`)" if fix.get("where") else ""
+            entries.append(f"  {k}. {about}: {plain(fix.get('what'))}{where}")
     out = {
         "FIRST_N": str(plan["confirms"]),
         "FROM_SHA": plan["from_sha"],
@@ -346,6 +573,13 @@ def _confirm_values(cfg: dict, run: dict, values: dict, plan: dict) -> dict:
         "DELTA_FACTS": "\n".join("  " + line for line in review.facts_text(plan["facts"]).splitlines()),
         "REPO_FACTS": _repo_facts_text(program.repo_facts(cfg, run["repo"])),
     }
+    if red is not None:
+        # The manager's note to the builder of this rework, where it wrote one: what it read in the failed runs.
+        note = rework_note(d, items.load_attempts(d.parent.parent, d.name)["build"])
+        known = {**values, **out, "CHECKS_FILE": plan["checks_file"], "REWORK_NOTE_LINE": f" The manager's note to the builder about them: `{note}`." if note.exists() else ""}
+        out.update(CONFIRM_FROM=_fill(blocks["confirm-from-checks"], known), FIX_LIST_INTRO=_fill(blocks["fix-list-checks"], known))
+    else:
+        out.update(CONFIRM_FROM=_fill(blocks["confirm-from-review"], {**values, **out}), FIX_LIST_INTRO=blocks["fix-list-review"])
     pages = sorted({(str(look.get("mode", "")).strip(), str(look.get("url", "")).strip()) for look in plan["looks"]})
     if pages:
         listed = "\n".join(f"  - `{plain(url)}`, mode `{plain(mode)}`" for mode, url in pages)
@@ -363,7 +597,7 @@ def _review_values(cfg: dict, run: dict, item: dict, d: Path, n: int, values: di
     """What a review brief carries beyond a grade's: the diff's facts, what
     the repository's checks run, and whether the item is one a person looks at."""
     if (plan or {}).get("kind") == "delta":
-        return _confirm_values(cfg, run, values, plan)
+        return _confirm_values(cfg, run, d, values, plan)
     out: dict = {}
     facts_of_repo = program.repo_facts(cfg, run["repo"])
     blocks = brief_blocks(cfg)
@@ -400,6 +634,8 @@ def _review_values(cfg: dict, run: dict, item: dict, d: Path, n: int, values: di
         out["CHECKS"] = filled(blocks["checks-known"], {"CI_COVERS": _bullets(covered), "NOT_IN_CI": not_in_ci}).strip()
     else:
         out["CHECKS"] = filled(blocks["checks-unknown"])
+    if items.option(run, "write_list") == "note":
+        out["CHECKS"] += "\n\n" + filled(blocks["write-list-review"])
     return out
 
 
@@ -428,18 +664,36 @@ def _brief_values(
         **{name: fields.get(field) for name, field in FROM_FIELDS.items()},
     }
     values["CHECKOUT"] = values["CHECKOUT"] or values["WORKTREE"]
+    # The kit's in-page text-fit check, the copy of it `start` puts where this worker's browser can run it from a
+    # file, and the paragraph every look block carries that says how to use them.
+    values["TEXT_FIT"] = str(Path(cfg["kit"]) / "references" / "text-fit.js")
+    here = worker_dir(d, phase, n, fields)
+    values["TEXT_FIT_RUN"] = str(here / TEXT_FIT_RUN) if here else None
+    blocks = brief_blocks(cfg)
+    # Whether a review that skipped a width counts (`items.OPTIONS`): the text-fit paragraph says which.
+    values["TEXT_FIT_RULE"] = blocks["text-fit-recorded" if items.option(run, "text_fit_widths") == "recorded" else "text-fit-counted"]
+    values["TEXT_FIT_STEP"] = _fill(blocks["text-fit"], values)
+    # A run that takes a criterion limiting the paths as a note tells the contract's drafter to write none.
+    noted = items.option(run, "write_list") == "note"
+    values["WRITE_LIST_CONTRACT"] = " " + _fill(blocks["write-list-contract"], values) if noted else ""
     # The slot a brief that is rendered only once its build is served keeps for the manager's note (`--note-file`): empty without one.
     values["MANAGER_NOTE"] = ""
     # An item that serves nothing has no port to record.
     values["PORT"] = values["PORT"] or NO_PORT
+    # What the build brief says of a Serve line that starts nothing: sent back, or, where the spec gives the repository its
+    # own serve command, served with that command in its place (`contractfmt.serving`).
+    default = program.repo_facts(cfg, run["repo"]).get("serve")
+    if default and str(values["PORT"]).isdigit():
+        port = str(values["PORT"])
+        values["SERVE_RULE"] = _fill(blocks["serve-default"], {"SERVE_DEFAULT": default["command"].replace(contractfmt.PORT_SLOT, port), "SERVE_DEFAULT_READY": default["ready"].replace(contractfmt.PORT_SLOT, port), "PORT": port})
+    else:
+        values["SERVE_RULE"] = blocks["serve-own"]
 
-    report = d / f"build-{attempts['build']}.md"
-    if report.exists():
-        try:
-            how = contractfmt.how_to_run(report.read_text())
-            values["HOW_TO_RUN"] = f"**Serve.** `{how['serve']}`\n  **Ready.** {how['ready_kind']} `{how['ready']}`"
-        except contractfmt.ContractError:
-            pass
+    how = serving(run_dir, item_id, cfg)
+    if how:
+        values["HOW_TO_RUN"] = f"**Serve.** `{how['serve']}`\n  **Ready.** {how['ready_kind']} `{how['ready']}`"
+        if how.get("serve_default"):
+            values["HOW_TO_RUN"] += "\n  (The repository's own serve command, from the program's spec: the build report's Serve line starts nothing.)"
     served = d / f"serve-{attempts['build']}.json"
     values["REFERENCE"] = ""
     if served.exists():
@@ -456,9 +710,27 @@ def _brief_values(
         values.update(_builder_values(cfg, run, item, values, engine))
     if phase == "correction":
         values["DISPUTE"] = _dispute_text(d, attempts, grades, (sets or {}).get("CRITERION"))
+    if phase == "walk":
+        values.update(_walk_values(cfg, run, d, n))
     if phase == "grade" and items.policy(run)["review"] == "code":
         values.update(_review_values(cfg, run, item, d, n, values, used or set(), plan, tools))
     return values
+
+
+def _walk_values(cfg: dict, run: dict, d: Path, n: int) -> dict:
+    """What a page walk's brief carries: the commit and where it is checked out, and how the repository is made ready and served."""
+    facts = program.repo_facts(cfg, run["repo"])
+    serve = facts.get("serve")
+    return {
+        "WALK_COMMIT": walk_commit(d.parent.parent, d.name),
+        "WALK_CHECKOUT": str(walk_checkout(d, n)),
+        "WALK_SETUP": f"`{facts['setup']}`" if facts.get("setup") else "none is named: the checkout needs nothing before it is served, unless the facts below say so",
+        "WALK_SERVE": (
+            f"`{serve['command']}`, up once `{serve['ready']}` answers ({contractfmt.PORT_SLOT} is a port you take as step 3 says)"
+            if serve
+            else "none is named: the facts below say how each server is started"
+        ),
+    }
 
 
 def checks_file(item_dir, build: int) -> Path:
@@ -531,6 +803,9 @@ def brief_text(root, run_dir, item_id: str, phase: str, sets: dict[str, str] | N
         )
     if unknown:
         raise Refusal(f"{template_name} has no placeholder named {', '.join(unknown)}")
+    kits = sorted(set(sets) & set(WALK_VALUES)) if phase == "walk" else []
+    if kits:
+        raise Refusal(f"{', '.join(kits)} {'is' if len(kits) == 1 else 'are'} the kit's to fill, from the commit it checks out for the walk; leave out --set {kits[0]}")
     values = {**_brief_values(cfg, run_dir, item_id, phase, n, used, engine, sets, plan, tools), **sets}
     missing = sorted(name for name in used if values.get(name) is None)
     if missing:
@@ -583,20 +858,48 @@ def worker_agents(cfg: dict) -> dict:
     return read_json(Path(cfg["kit"]) / "references" / "worker-agents.json")
 
 
+def compacts(cfg: dict, phase: str) -> str | None:
+    """The window this attempt's conversation is compacted against (`builder_autocompact`): a build's, when the
+    program sets one. Claude Code compacts some way below it (`program.DEFAULTS`)."""
+    return cfg.get("builder_autocompact") if phase == "build" else None
+
+
+def reread_brief(brief: Path) -> str:
+    """What a build is told when its conversation has just been compacted: the summary keeps what it did, and may
+    have dropped what it was asked."""
+    return (
+        f"Your conversation was compacted just now, and its summary may have left out part of your brief. Before you go on, read your brief again, whole: {brief}. "
+        "It is everything you were asked to do and how to report it; what you have done so far is in your worktree and your pull request."
+    )
+
+
 def worker_settings(cfg: dict, item_dir: Path, phase: str, n: int) -> Path:
-    """The settings file a Claude worker starts with. With sub-agents open it
-    is the kit's file plus the guard hook, written beside the attempt: a
-    hook's command is an absolute path, and the kit sits under the loop root.
-    The guard keeps every sub-agent in the foreground, on the worker's own
-    model, and refuses any type the kit does not define."""
+    """The settings file a Claude worker starts with: the kit's file, or, when
+    the attempt needs a hook, the kit's file plus its hooks, written beside the
+    attempt (a hook's command is an absolute path, and the kit sits under the
+    loop root).
+
+    With sub-agents open, the guard: it keeps every sub-agent in the
+    foreground, on the worker's own model, and refuses any type the kit does
+    not define. For a build that compacts (`builder_autocompact`), a
+    SessionStart hook on compaction that has it read its brief again: Claude
+    Code adds what such a hook prints to the conversation, and the docs name
+    the pattern ("Use a `SessionStart` hook with a `compact` matcher to
+    re-inject critical context after every compaction")."""
     base = Path(cfg["kit"]) / "references" / "worker-settings.json"
-    if not cfg.get("subagents"):
+    hooks: dict = {}
+    if cfg.get("subagents"):
+        guard = Path(cfg["kit"]) / "scripts" / "hooks" / "agent-guard"
+        # `|| exit 2`: a hook that cannot run at all is otherwise a warning, and the call it was to guard goes ahead.
+        command = " ".join(shlex.quote(part) for part in (str(guard), *sorted(worker_agents(cfg)))) + " || exit 2"
+        hooks["PreToolUse"] = [{"matcher": SUBAGENT_MATCHER, "hooks": [{"type": "command", "command": command}]}]
+    if compacts(cfg, phase):
+        said = reread_brief(item_dir / f"{phase}-{n}.brief.md")
+        hooks["SessionStart"] = [{"matcher": "compact", "hooks": [{"type": "command", "command": f"printf '%s\\n' {shlex.quote(said)}"}]}]
+    if not hooks:
         return base
     settings = read_json(base)
-    guard = Path(cfg["kit"]) / "scripts" / "hooks" / "agent-guard"
-    # `|| exit 2`: a hook that cannot run at all is otherwise a warning, and the call it was to guard goes ahead.
-    command = " ".join(shlex.quote(part) for part in (str(guard), *sorted(worker_agents(cfg)))) + " || exit 2"
-    settings["hooks"] = {"PreToolUse": [{"matcher": SUBAGENT_MATCHER, "hooks": [{"type": "command", "command": command}]}]}
+    settings["hooks"] = hooks
     path = item_dir / f"{phase}-{n}.settings.json"
     write_json(path, settings)
     return path
@@ -617,13 +920,13 @@ def effort_for(cfg: dict, role: str, rework: bool, asked: str | None = None) -> 
 
 
 def _argv(
-    cfg: dict, engine: str, role: str, ui: bool, session: str | None, resume: bool, effort: str | None, settings: Path | None = None
+    cfg: dict, engine: str, role: str, ui: bool, session: str | None, resume: bool, effort: str | None, settings: Path | None = None, mcp: Path | None = None, compact: str | None = None
 ) -> list[str]:
+    """`mcp`: an MCP configuration of the attempt's own (the page walk's), in place of the role's."""
     if engine == "cursor":
         # The operator's own launch line, plus the model.
         return ["--force", "--trust", "--approve-mcps", "--sandbox", "disabled", "--model", cfg["cursor_model"]]
     references = Path(cfg["kit"]) / "references"
-    mcp = "mcp-playwright.json" if (role == "evaluator" or ui) else "mcp-none.json"
     subagents = bool(cfg.get("subagents"))
     argv = [
         "--dangerously-skip-permissions",
@@ -642,11 +945,17 @@ def _argv(
         str(settings or references / "worker-settings.json"),
         "--strict-mcp-config",
         "--mcp-config",
-        str(references / mcp),
+        str(mcp or references / ("mcp-playwright.json" if (role == "evaluator" or ui) else "mcp-none.json")),
     ]
     if subagents:
         # The kit's own sub-agent types. Each names its tools, so none has a browser and none can start another.
         argv += ["--agents", agents_argument(cfg)]
+    if compact:
+        problem = program.autocompact_problem(compact)
+        if problem:
+            raise Refusal(f"program.json: {problem}")
+        # A resumed build is launched here too, so a rework compacts at the same size.
+        argv += ["--autocompact", compact]
     return argv
 
 
@@ -661,13 +970,15 @@ def agents_argument(cfg: dict) -> str:
     return inline.replace("'", "\\u0027").replace("`", "\\u0060")
 
 
-def _load_secrets(herdr, pane: str, cfg: dict, engine: str) -> None:
+def _load_secrets(herdr, pane: str, cfg: dict, engine: str, github: bool = True) -> None:
     """Fetch the worker's tokens inside its own pane. The sentinel is not in
-    the typed line, so only the script's own success can match it."""
+    the typed line, so only the script's own success can match it. Without
+    `github` the pane gets no GitHub token (`-`)."""
     nonce = secrets.token_hex(4)
     script = Path(cfg["kit"]) / "scripts" / "hl-env.sh"
     claude_ref = cfg["worker_claude_ref"] if engine == "claude" else "-"
-    line = f". {shlex.quote(str(script))} {shlex.quote(claude_ref)} {shlex.quote(cfg['gh_token_ref'])} {nonce}"
+    gh_ref = cfg["gh_token_ref"] if github else "-"
+    line = f". {shlex.quote(str(script))} {shlex.quote(claude_ref)} {shlex.quote(gh_ref)} {nonce}"
     if keeper.in_use(cfg):
         # With the root as a fourth word the pane asks the program's keeper, which read each token once, in place
         # of the store (a 1Password service account counts every read against the account's limit for the day).
@@ -957,6 +1268,13 @@ def end_run(run_dir, herdr) -> dict:
     for d in sorted(p for p in (Path(run_dir) / "items").iterdir() if p.is_dir()):
         in_use += [f"{d.name}/{name}" for name in _open_workers(run_dir, d.name)]
         in_use += [f"{d.name}/{p.name}" for p in sorted(d.glob("serve-*.json")) if _being_served(read_json(p))]
+    walking = [name for name in in_use if name.split("/", 1)[1].startswith("walk-") and name.endswith(".worker.json")]
+    if walking:
+        # Closed now, a walk would end mid-walk: it is read and placed first, and the run ends after that.
+        raise Refusal(
+            f"the file's page walk is still open ({', '.join(walking)}): leave it running. Once it is done, read it, close it (`hl-spawn close`) "
+            "and place its defects; end the run after that"
+        )
     if in_use:
         raise Refusal(f"the run still has something open ({', '.join(in_use)}); close it with `hl-spawn close` or `hl-serve stop` first")
     open_work = unshipped(run_dir)
@@ -1038,6 +1356,13 @@ def start(
     still_open = _open_workers(run_dir, item_id)
     if still_open:
         raise Refusal(f"{item_id} still has a worker open ({', '.join(still_open)}); close it with `hl-spawn close` first")
+    queued = merge.queued_record(run_dir, item_id)
+    if queued:
+        # A review that failed now would not stop the queue merging the head it holds, nor would a build.
+        raise Refusal(
+            f"{item_id}'s pull request #{queued.get('pr')} waits in the base's merge queue at {str(queued.get('head_sha'))[:12]}, and nothing "
+            f"started now would stop the queue merging it: run `hl-merge --id {item_id}` first, and go on once it says the pull request is out"
+        )
     if herdr_mod.worker_path(d, phase, n).exists():
         raise Refusal(
             f"{phase} {n} of {item_id} was started before and its worker record is still there. If that worker ended "
@@ -1049,6 +1374,21 @@ def start(
     past = items.bound_reached(run_dir, item_id, phase)
     if past:
         raise Refusal(past)
+    walk = browser = None
+    if phase == "walk":
+        problem = walk_problem(cfg, run_dir, item_id)
+        if problem:
+            raise Refusal(problem)
+        if NOTE not in (opts.sets or {}):
+            raise Refusal("a page walk walks the pages the manager names: pass `--note-file <a file that lists the pages the file's items changed>`")
+        commits, clone = walk_commits(run_dir), stream_clone(cfg, items.load_run(run_dir))
+        browser = walk_browser(cfg)
+        tools = tools or pinned_tools(root)
+        _walk_fetch(root, clone, sorted(set(commits.values())), cfg["base"], tools)
+        tip = walk_tip(tools, clone, commits, {i: items.load_item(run_dir, i).get("merged_at") for i in commits})
+        if item_id != tip:
+            raise Refusal(f"the walk starts on the file's last merged item, {tip}, whose commit holds the whole file")
+        walk = {"clone": str(clone), "checkout": str(walk_checkout(d, n)), "commit": commits[item_id]}
 
     brief = brief_path(run_dir, item_id, phase, n)
     plan = baseline = None
@@ -1064,14 +1404,14 @@ def start(
         # build was served: its checkout is held to the commit as it is now, but for the paths the spec names.
         held = baseline and {**baseline, "dirty": {path: baseline["dirty"][path] for path in unnamed}}
         served = d / f"serve-{attempts['build']}.json"
-        serving = served.exists() and _being_served(read_json(served))
-        if serving and read_json(served).get("checkout_changed"):
+        being_served = served.exists() and _being_served(read_json(served))
+        if being_served and read_json(served).get("checkout_changed"):
             raise Refusal(
                 f"the build of {item_id} that is being served was started before its checkout was put back: stop it (`hl-serve stop --id {item_id}`), "
                 f"serve it again (`hl-serve start --id {item_id}`), and run this again"
             )
         changed = review.begins_changed(held, worktree, item_id, opts.head_sha or item["fields"].get("head_sha"), item["fields"].get("branch"), held and (tools or pinned_tools(root)))
-        if changed and serving:
+        if changed and being_served:
             # Put back under a build that is still up, the checkout would be the commit and the build would not: noted on the build's own record.
             write_json(served, {**read_json(served), "checkout_changed": True})
             raise Refusal(
@@ -1103,15 +1443,13 @@ def start(
         raise Refusal(f"the pointer to the brief is {len(prompt)} characters; over {MAX_PROMPT} it arrives as pasted content")
 
     fields = item["fields"]
+    usual = worker_dir(d, phase, n, fields)
     if opts.cwd:
         cwd = Path(opts.cwd).resolve()
-    elif role == "evaluator":
-        # An evaluator works beside the item, never in the repository: what it
-        # and its browser write must not show up in the builder's worktree.
-        cwd = (d / (f"evidence-{n}" if phase == "grade" else f"{phase}-{n}.work")).resolve()
-        cwd.mkdir(exist_ok=True)
     else:
-        cwd = Path(fields["worktree"]).resolve() if fields.get("worktree") else None
+        cwd = usual
+        if role == "evaluator":
+            cwd.mkdir(exist_ok=True)
     if cwd is None or not cwd.is_dir():
         raise Refusal(f"no working directory for the worker: record `--field worktree=<path>` or pass --cwd (got {cwd})")
     if root not in cwd.parents and cwd != root:
@@ -1165,21 +1503,27 @@ def start(
     _write_brief(brief, was, phase, plan, n)
     pane = None
     shells = reap.shells_path(d, phase, n)
+    mcp = d / f"walk-{n}.mcp.json" if walk else None
     try:
+        if walk:
+            # Made only now, once the attempt is counted, and removed again below if the worker does not come up.
+            _make_walk_checkout(tools, walk)
+            write_json(mcp, browser)
         workspace = opts.workspace or run_workspace(herdr, cfg, run_dir)
         made = herdr.call("tab", "create", "--workspace", workspace, "--cwd", str(cwd), "--label", f"{item_id} {phase}-{n}", "--no-focus")
         pane, tab = made["root_pane"]["pane_id"], made["tab"]["tab_id"]
-        _load_secrets(herdr, pane, cfg, engine)
+        _load_secrets(herdr, pane, cfg, engine, github=not walk)
         if engine == "claude":
             set_claude_home(herdr, pane, cfg)
         settings = worker_settings(cfg, d, phase, n) if engine == "claude" else None
-        argv = _argv(cfg, engine, role, ui, session if engine == "claude" else None, resume, effort, settings)
+        argv = _argv(cfg, engine, role, ui, session if engine == "claude" else None, resume, effort, settings, mcp, compacts(cfg, phase) if engine == "claude" else None)
         mark_shells(herdr, pane, cfg, shells)
         _start_agent(herdr, name, engine, pane, argv, sleep)
         info = herdr.call("pane", "process-info", "--pane", pane)["process_info"]
         pid = next((p.get("pid") for p in info.get("foreground_processes", []) if p.get("argv0") == AGENT_ARGV0[engine]), None)
         own_token = engine == "claude" and cfg["worker_claude_ref"] != program.SIGNED_IN
-        needed = ("CLAUDE_CODE_OAUTH_TOKEN", "GH_TOKEN") if own_token else ("GH_TOKEN",)
+        # A walk reads and writes nothing on GitHub: its pane is given no token for it.
+        needed = (("CLAUDE_CODE_OAUTH_TOKEN",) if own_token else ()) + (() if walk else ("GH_TOKEN",))
         if engine == "claude" and program.claude_home(cfg):
             # The proof it runs on the program's sign-in and not the host's default.
             needed += ("CLAUDE_CONFIG_DIR",)
@@ -1190,6 +1534,8 @@ def start(
             # Without its own token a Claude worker would run on the manager's account. Only a program whose
             # worker_claude_ref is `-` runs its Claude workers there, and that is the operator's choice.
             raise Refusal(f"{name} (pid {pid}) is running without {', '.join(absent)}")
+        if walk and envs.has(pid, "GH_TOKEN"):
+            raise Refusal(f"{name} (pid {pid}) has a GitHub token, which a page walk is not given")
     except (Refusal, HerdrError) as failure:
         # What the pane showed, read before the pane goes: a worker that printed why it would not start has said it there and nowhere else.
         shown = _last_lines(herdr, pane) if pane else ""
@@ -1201,6 +1547,12 @@ def start(
                 pass
             # An agent that came up and was refused may have started something already (an MCP server, a browser).
             stopped = reap.said(_reap(procs, shells))
+        if walk:
+            try:
+                left = remove_walk_checkout(tools, walk)
+            except (Refusal, OSError) as error:
+                left = f"its checkout {walk['checkout']} was not removed ({error})"
+            stopped = f"{stopped}; {left}" if stopped and left else stopped or left
         if phase != "contract-draft":
             items.void_attempt(run_dir, item_id, phase, n, f"spawn: the worker did not come up: {failure}")
         reasons = failure.reasons if isinstance(failure, Refusal) else [str(failure)]
@@ -1228,10 +1580,20 @@ def start(
         "effort": effort,
         "browser": engine == "claude" and (role == "evaluator" or ui),
         "subagents": engine == "claude" and bool(cfg.get("subagents")),
+        "autocompact": compacts(cfg, phase) if engine == "claude" else None,
     }
+    if walk:
+        # What `close` removes once the walk's processes are stopped.
+        record["walk"] = walk
     if engine == "claude":
         record["session"] = session
     herdr_mod.write_worker(d, phase, n, record)
+    runner = usual / TEXT_FIT_RUN if usual else None
+    if runner and str(runner) in was:
+        # The brief names it: the check as it is now, where the worker's browser may read it. Written once the worker is
+        # up, so a start that was refused leaves its directory as it found it.
+        runner.parent.mkdir(parents=True, exist_ok=True)
+        write_text(runner, text_fit_run_text(cfg["kit"]))
 
     # How many lines lay below the script's own brief and went with it: a manager that added none sees that something did.
     out = {"started": True, "watch": f"{item_id}:{phase}-{n}", **record, "prompt_sent": True, "brief_notes": notes["lines"] if notes else 0}
@@ -1271,10 +1633,12 @@ def send(run_dir, item_id: str, phase: str, n: int, file: str, herdr, sleep=time
     return {"prompted": True, "agent": record["agent"], "file": str(path), "watch": f"{item_id}:{phase}-{n}"}
 
 
-def close(run_dir, item_id: str, phase: str, n: int, herdr, sleep=time.sleep, procs=None) -> dict:
+def close(run_dir, item_id: str, phase: str, n: int, herdr, sleep=time.sleep, procs=None, tools=None, root=None) -> dict:
     """Close the worker's pane, then stop what it left running: the
     processes still in a session one of its shells led (`hl/reap.py`). What
-    was stopped, and anything KILL did not end, goes on the worker record."""
+    was stopped, and anything KILL did not end, goes on the worker record.
+    A page walk's checkout is removed then, with `tools`, or else the
+    program's pinned git (`root`)."""
     d = items.item_dir(run_dir, item_id)
     record = herdr_mod.read_worker(d, phase, n)
     if record.get("closed_at"):
@@ -1309,6 +1673,16 @@ def close(run_dir, item_id: str, phase: str, n: int, herdr, sleep=time.sleep, pr
             out["warning"] = f"still running after KILL: {', '.join(str(p['pid']) for p in reaped['left'])}; read what they are (`ps -o pid,ppid,stat,command -p <pid>`) before the next attempt"
     else:
         note = f"{note}; its shells were not written down (started by an older kit), so nothing it left running was looked for"
+    if record.get("walk"):
+        # Once what it served is stopped: nothing holds the checkout's files then. The pane is closed already, so a
+        # git that cannot be had is said, and the worker is still recorded as closed.
+        try:
+            left = remove_walk_checkout(tools or (walk_git(root) if root else merge.Tools()), record["walk"])
+        except (Refusal, OSError) as error:
+            left = f"its checkout {record['walk']['checkout']} was not removed ({error}): remove it with `git -C {record['walk']['clone']} worktree remove --force <it>`"
+        note = f"{note}; {left}" if left else f"{note}; its checkout is removed"
+        if left:
+            out["warning"] = f"{out['warning']}; {left}" if out.get("warning") else left
     record.update(closed_at=utc_now(), close_note=note)
     herdr_mod.write_worker(d, phase, n, record)
     return {**out, "note": note}
@@ -1415,7 +1789,7 @@ def main(argv: list[str] | None = None, herdr=None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.cmd == "brief":
-            plan = review_plan(program.load(args.root), args.run_dir, args.id, args.full, how_run=served_as(args.run_dir, args.id)) if args.phase == "grade" else None
+            plan = review_plan(program.load(args.root), args.run_dir, args.id, args.full, how_run=served_as(args.run_dir, args.id, program.load(args.root))) if args.phase == "grade" else None
             path = render_brief(args.root, args.run_dir, args.id, args.phase, _sets(args.sets, args.note_file), args.engine, plan=plan)
             # For a review in a run whose reworks may get a delta confirm: which of the two this brief is, and why.
             emit({"brief": str(path), **({"confirm": f"{plan['kind']}: {plan['why']}"} if (plan or {}).get("why") else {})})
@@ -1430,7 +1804,8 @@ def main(argv: list[str] | None = None, herdr=None) -> int:
         elif args.cmd == "prompt":
             emit(send(args.run_dir, args.id, args.phase, args.n, args.file, herdr))
         elif args.cmd == "close":
-            emit(close(args.run_dir, args.id, args.phase, args.n, herdr))
+            # The pins are read inside `close`, once the pane is closed, so a git that cannot be had leaves no walk open.
+            emit(close(args.run_dir, args.id, args.phase, args.n, herdr, root=args.root if args.phase == "walk" else None))
         elif args.cmd == "end-run":
             emit(end_run(args.run_dir, herdr))
     except (Refusal, HerdrError) as failure:

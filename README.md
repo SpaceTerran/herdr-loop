@@ -23,10 +23,11 @@ The write-up, with the reasoning, the figures and the numbers, is on the blog: [
     design.md                     why things are the way they are, with the failures that shaped them
     program.spec.template.json    a program's spec
     program.template.json         the kit's settings, which a spec's `settings` override
+    text-fit.js                   the in-page check every look runs: text cut, spilling, overlapping or wrapping
   scripts/
     hl-flow, hl-merge, hl-verify, hl-wait, hl-spawn, hl-watchdog, hl-secrets, ...
     stage.sh, install-watchdog.sh, hl-read-secret
-    tests/                        about 1,600 tests; staging runs them before a program starts
+    tests/                        about 1,900 tests; staging runs them before a program starts
 programs/example/                 a filled-in example spec and backlog file
 ```
 
@@ -120,8 +121,8 @@ With `"secrets": "keeper"` (the template's setting), one small process per progr
 
 Read `references/authoring.md` first. Then copy `programs/example/` to `programs/<name>/` in your control repository and edit it:
 
-- **`program.spec.json`**: the program's name; its loop root (`/Users/<you>/loops/<name>`); its ledger branch; the target repository; one or more **streams** (a stream is a lane of work with its own clone, the paths it may write, and its first backlog file); the facts of each repository, said once (what its required checks run, the command that makes a checkout ready, the paths a person sees, the paths no item may change); and four short pieces of prose for the manager prompt (the files in order with any gates between them, what counts as production, how much may run at once, and who else uses the seats). `references/program.spec.template.json` explains every key.
-- **Backlog files** (`*-ITEMS.md`): one `## <ID> — <title>` section per item, each with a **Scope**, an **Accept** list of observable results with their values before the change, optional **Depends** and **Floor**, and a **Verify** line the loop runs after the deploy. Most of the work is here. Write behavior, not "the test suite passes".
+- **`program.spec.json`**: the program's name; its loop root (`/Users/<you>/loops/<name>`); its ledger branch; the target repository; one or more **streams** (a stream is a lane of work with its own clone, the paths it may write, and its first backlog file); the facts of each repository, said once (what its required checks run, the command that makes a checkout ready, which runs without any of the loop's tokens, the paths a person sees, the paths no item may change); and four short pieces of prose for the manager prompt (the files in order with any gates between them, what counts as production, how much may run at once, and who else uses the seats). `references/program.spec.template.json` explains every key.
+- **Backlog files** (`*-ITEMS.md`): one `## <ID> — <title>` section per item, each with a **Scope**, an **Accept** list of observable results with their values before the change, optional **Depends**, **Floor** and **Origin** (new work, or a repair, an audit finding or a rule change it comes from), and a **Verify** line the loop runs after the deploy. Most of the work is here. Write behavior, not "the test suite passes".
 
 Commit and push both to your control repository.
 
@@ -166,6 +167,23 @@ This adds a LaunchAgent that looks every five minutes and starts a manager whene
 
 When the last backlog file is complete, the manager proves the closing gates, closes every run's workspace, writes the closing state in the ledger, disarms the watchdog and tells you. Then remove the watchdog (`install-watchdog.sh --remove <root>`), and merge the ledger branch into your control repository if you want to keep the record.
 
+## Settings that are off by default
+
+Each of these changes what the loop does, so each is off until a spec turns it on. `references/authoring.md` says what each needs, and `references/design.md` why it exists and what it was measured on.
+
+- **`merge_queue: true`** (a repository fact): merge through the base's GitHub merge queue instead of one merge at a time. Turn the queue on first (the `merge_group` trigger on the required workflows, then the ruleset's queue, with branches no longer required to be up to date), and set the fact straight after.
+- **`confirm_red_checks: delta`** (beside `confirm: delta`): a small fix for checks that came out red after a review passed gets a delta confirm instead of a second full review. The checks still run again before anything merges.
+- **`write_list: note`**: a criterion that only limits which paths a change may write becomes a note for the manager, not a failed review.
+- **`text_fit_widths: recorded`**: a review whose text-fit check skipped a width still counts, where the repository's own required check runs the text-fit check (its `text_fit_check` fact).
+- **`serve`** (a repository fact): the repository's own command serves a looked-at build whose Serve line starts nothing, instead of sending the build back.
+- **`builder_autocompact`**, such as `180k`: Claude builds compact against that window, and read their brief again after each compaction.
+- **`closing_audit: pages`**: the closing audit of a finished backlog file also walks the pages the file changed, as a worker whose browser reaches only `127.0.0.1` and `localhost`.
+- **`wait_delivery: prompt`**: the manager starts each wait with `hl-wait --deliver`, and the event arrives as its next message instead of a background task's output.
+- **`item_origin: required`**: every item of a new run must carry its **Origin** line.
+- **`watch_logs`**: logs of outside work the program depends on (a loader, an import); every save says how long ago each was written.
+
+Every `hl-flow save` also answers `velocity`, over the last 40 merged items: how long a passed item waits to merge, reviews and rebuilds per item, how often a first build passes its first review, how the deploy checks came out, where items came from, a build's peak context, and tokens and manager commands per merged item. Switch one change on at a time, and keep or revert it on one of those numbers.
+
 ## When something goes wrong
 
 `references/troubles.md` is organized by what a script reported. `references/host-facts.md` says what the kit expects of the host and how each fact was learned. The manager reads the same files.
@@ -178,7 +196,7 @@ Run the tests from the kit's `scripts/` directory:
 python3 -m unittest discover -s tests -t .
 ```
 
-The rules for changes are at the end of `SKILL.md`. The short version: a script may refuse but not decide; a new behavior gets a setting whose absence means the old behavior; and a rule leaves a brief only when a script holds it.
+The rules for changes are at the end of `SKILL.md`. The short version: a script may refuse but not decide; a new behavior gets a setting whose absence means the old behavior; a new rule comes with a count of the real defects it would have caught, or with the removal of another rule; and a rule leaves a brief only when a script holds it.
 
 ## License
 

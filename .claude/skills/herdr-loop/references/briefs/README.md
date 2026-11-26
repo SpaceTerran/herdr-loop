@@ -11,6 +11,7 @@ One brief per worker, per attempt. `hl-spawn` fills a template from the item's r
 | `confirm.md` (phase `grade`, a review the script gives as a delta confirm, in runs whose policy is `confirm: delta`) | evaluator (confirms a fix) | Claude | `verdict-<n>.json` | `PASS`, `FAIL`, `INCONCLUSIVE`, with an answer for each entry of the failed review's fix list |
 | `grade.md` (phase `grade`, runs whose policy is `review: blind`) | evaluator | Claude | `verdict-<n>.json` | `PASS`, `FAIL`, `INCONCLUSIVE` |
 | `correction.md` | evaluator | Claude | `correction-<n>.md` | `STANDS`, or `## Amended contract` then `CORRECTED` |
+| `walk.md` (phase `walk`, programs whose closing audit is `pages`) | evaluator (walks a completed file's pages) | Claude | `walk-<n>.md` | a line per defect, then `## Not reached` |
 
 Every brief ends the same way: write the result file, create the empty `<phase>-<n>.done` file, end the turn. The done file is the only completion signal the manager trusts.
 
@@ -52,13 +53,18 @@ A rule left the brief only where a script now holds it. Each line below is eithe
 | `{{LOOK}}` in `build.md` | `look-builder`, `look-builder-none`, `no-look-builder`, `look-builder-unknown` | the item's route and floor, and whether the worker has a browser (a Cursor builder has none) |
 | `{{LOOK}}` in `review.md` | `look-review`, `no-look-review`, `look-unknown-review` | the item's route and floor |
 | `{{LOOK}}` in `confirm.md` | `look-confirm` (with `{{LOOK_PAGES}}`), `no-look-confirm` | whether the failed review recorded looks |
+| `{{TEXT_FIT_STEP}}` in `look-review`, `look-unknown-review`, `look-confirm` and `look-builder` | `text-fit` (with `{{TEXT_FIT}}`, `{{TEXT_FIT_RUN}}`) | always: every look also measures whether text fits |
 | `{{REFERENCE}}` in `look-review` and `look-confirm` | `reference` (with `{{REFERENCE_ROOT}}`, `{{REFERENCE_URL}}`), or nothing | whether `hl-serve` is serving the repository's `reference` directory beside the build (`serve-<n>.json`) |
 | `{{TESTING}}` | `testing-touched`, `testing-full`; `testing-train` for a run on a train | `prepush` in `program.json`; the run's policy |
 | `{{HELPERS}}` | `helpers`, `no-helpers` | `subagents` in `program.json`, and the engine |
 | `{{SETUP}}` | `setup-ready` | the item's `setup` field (`ready` when `hl-flow prepare` ran the repository's setup command) |
 | `{{PROTECTED}}` | `protected` | the repository's `protected` paths, and any of them the manager exempted for this item (`hl-items exempt`) |
-| `{{CHECKS}}` | `checks-known` (with `not-in-ci`), `checks-unknown`; `checks-train` for a run on a train | the repository's `ci_covers` and `not_in_ci`; the run's policy |
+| `{{CHECKS}}` | `checks-known` (with `not-in-ci`), `checks-unknown`; `checks-train` for a run on a train; each followed by `write-list-review` in a run that is `write_list: note` | the repository's `ci_covers` and `not_in_ci`; the run's policy |
+| `{{TEXT_FIT_RULE}}` in `text-fit` | `text-fit-counted`, `text-fit-recorded` | the run's `text_fit_widths`: whether a review whose check skipped a width counts |
+| `{{SERVE_RULE}}` in `build.md` | `serve-own`, `serve-default` (with `{{SERVE_DEFAULT}}`, `{{SERVE_DEFAULT_READY}}`) | whether the repository has a `serve` fact and the item a port: a Serve line that starts nothing is sent back, or served with the repository's command |
+| `{{WRITE_LIST_CONTRACT}}` in `contract.md`, at the end of a line | `write-list-contract`, or nothing | the run's `write_list`: in a `note` run the drafter writes no criterion that only limits the paths |
 | `{{CHECKS}}` in `confirm.md` | `checks-confirm`; `checks-confirm-train` for a run on a train | the run's policy |
+| `{{CONFIRM_FROM}}`, `{{FIX_LIST_INTRO}}` in `confirm.md` | `confirm-from-review` and `fix-list-review`; `confirm-from-checks` and `fix-list-checks` (with `{{CHECKS_FILE}}`, `{{REWORK_NOTE_LINE}}`) | whether the confirm answers a failed review's fix list, or the required checks that came out red after a review passed (`confirm_red_checks: delta`) |
 | `{{SHELL}}` in every brief of this set | `shell` | always: commands that never return (a read from stdin, an unbounded wait, a search from `/`, BSD `sed -i`), each of which stalled a worker in a help-desk feature program until the manager killed it; and background jobs, which must end without the worker |
 
 `{{REPO_FACTS}}` is the repository's `facts` list from `program.json`, under a heading, or nothing. `{{DIFF_FACTS}}` is what `hl/review.py` reads from git for the pull request.
@@ -78,6 +84,8 @@ Either way, `AGREED` leaves or installs that text, and an evaluator's amended co
 
 In a run whose policy is `confirm: delta`, `hl-spawn` asks `hl/confirm.py` whether the review about to start is a full review or a delta confirm, and briefs it from `review.md` or `confirm.md`. A confirm's reviewer is a fresh session that did not write the code or the failed review. Its brief is the failed review's fix list, numbered as it must be answered, the two commits the fix lies between, and what the fix touches. It answers each entry, says whether the fix breaks anything, and does not go through the criteria again.
 
+In a run that is also `confirm_red_checks: delta`, a rework after a review that passed, whose pull request's required checks then came out red on the commit it passed, gets the same confirm. Its entries are those checks, as `hl-wait --checks` recorded them in `checks-<build>.json`, each with the link to its run, and its brief points at `checks-<build>.md` for the command that prints each failed run's log, and at the manager's `rework-<n>.md` where there is one.
+
 Beside a confirm's brief `hl-spawn` writes `grade-<n>.confirm.json`, the plan the brief was rendered from. `hl-spawn start` renders the brief again every time and sends a file that is already there only if it begins with exactly that text; what follows is sent too and counted (`brief_notes`), and the script cannot tell whose lines they are. The plan is a record of the decision, and nothing reads it back. `--full` on `hl-spawn brief`, `hl-spawn start` or `hl-flow review` asks for a full review; nothing asks for a delta.
 
 Two things the brief asks for are also held by a script: `hl-verdict` refuses a verdict that does not answer every entry, and the merge gate reads the reviewer's transcript for each file's part of the fix, as this fix's own diff, in one result of its own commands, and for a look at each page the failed review looked at. One thing it asks for no script can hold: reading the fix against what the failed review passed.
@@ -91,6 +99,8 @@ Two things the brief asks for are also held by a script: `hl-verdict` refuses a 
 | Placeholder | Source |
 |---|---|
 | `{{ITEM_ID}}`, `{{RUN_ID}}`, `{{N}}`, `{{ITEM_DIR}}`, `{{REPO}}`, `{{EVIDENCE_DIR}}`, `{{BUILD_N}}`, `{{GRADE_N}}` | the run directory |
+| `{{TEXT_FIT}}` | the kit's `references/text-fit.js`, the in-page check a look falls back to passing to `browser_evaluate` |
+| `{{TEXT_FIT_RUN}}` | `.playwright-mcp/text-fit-run.js` in the worker's directory (an evaluator's beside the item, a builder's worktree): `hl-spawn start` writes it there from `text-fit.js` when the brief names it. The browser tool refuses a script file (`browser_run_code_unsafe`'s `filename`) outside the worker's directory |
 | `{{BASE}}` | where the item's pull request goes: the base in `program.json`, or the repository's train |
 | `{{DEPLOY_BASE}}` | the base in `program.json`, where a train's batches are promoted |
 | `{{TRAIN_RED}}`, `{{RED_FILE}}` | on a train: the `train-red` block while the latest tested batch is red, and the file that says what fails |

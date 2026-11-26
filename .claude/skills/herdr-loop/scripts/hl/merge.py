@@ -25,9 +25,20 @@ program.json says `"outside_prs": "adopt"` (hl/outside.py says why and how).
 While an outside merge's deploy check has not passed, no item merges into
 that repository on top of it.
 
-Exit codes: 0 merged (or dry run or after-build check passed), 2 refused by a
-gate, 3 lock not acquired in time, 4 branch is behind and must be updated,
-5 merge did not complete.
+Where the program's spec says `merge_queue: true` for the repository (never
+on a train), GitHub's merge queue makes the merge. Under the lock, after the
+second gate, the pull request goes into the base's queue at exactly the head
+the gate read, `merge.json` says `QUEUED`, and the lock is let go: the queue
+tests it on the latest base beside whatever else is queued, and merges it by
+the ruleset's method with the repository's own squash message. A branch
+behind its base is not held back for it. Run again, this reads where the
+pull request is: still queued (said again, nothing done), merged (recorded
+as of GitHub's `mergedAt`), or taken out (exit 6, with GitHub's reason).
+While an item of a run waits in the queue, nothing else of that run merges.
+
+Exit codes: 0 merged (or queued, or dry run or after-build check passed), 2
+refused by a gate, 3 lock not acquired in time, 4 branch is behind and must
+be updated, 5 merge did not complete, 6 taken out of the merge queue.
 """
 
 from __future__ import annotations
@@ -41,6 +52,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
+from datetime import datetime
 from pathlib import Path
 
 from . import claim, confirm, contractfmt, items, review, verdict
@@ -502,16 +514,23 @@ def gate(
     train_ahead: tuple[int, int] | None = None,
     repo_facts: dict | None = None,
     root=None,
+    queue: bool = False,
 ) -> dict:
     """Every condition a merge needs, checked together. Raises Refusal
     naming all that fail. Returns what the merge step needs.
+
+    `queue`: the merge goes through the base's merge queue (`queue_on`),
+    which tests the pull request on the latest base itself, so a branch
+    behind its base is said and not held.
 
     `train_ahead`, for a run on a train: how many merged items the train
     holds that have not been promoted, and the limit past which nothing
     more merges into it.
 
     A head merges on a passing full review of it, or on a passing delta
-    confirm of it that follows a failed full review of an ancestor. For the
+    confirm of it that follows a failed full review of an ancestor (or, in a
+    run that is `confirm_red_checks: delta`, a passed one whose required
+    checks then came out red on that ancestor). For the
     second, everything that let the confirm start is read again here, from
     git and the run's records (`confirm.chain_problems`). `repo_facts` is
     the repository's entry in program.json, which that reading needs."""
@@ -533,6 +552,7 @@ def gate(
     graded = grades[-1]
 
     style = items.policy(run)["review"]
+    skipped_widths: list[str] = []
     result = verdict.check(d, graded["n"], style=style)
     confirming = graded.get("kind") == items.CONFIRM
     # A confirm that cannot stand is followed by a full review of the same head, and every refusal of one says so.
@@ -546,7 +566,9 @@ def gate(
         # Read from the reviewer's own transcript here, at the gate, and held beside what the first read made of
         # it: the record of what was served lies where a worker can write, and what that read found stands.
         kept = (graded.get("read") or {}).get("exercise") or []
-        now = review.check(run_dir, item_id, graded["n"], tools, repo)["problems"]
+        checked = review.check(run_dir, item_id, graded["n"], tools, repo)
+        now = checked["problems"]
+        skipped_widths = checked.get("text_fit_skipped") or []
         reasons += [f"review {graded['n']}: {p}" for p in kept + [p for p in now if p not in kept]]
     # What the review did to its checkout: read once by `hl-flow reviewed`, when the review was over, against
     # the state noted when it began, and kept on the review's attempt. Nothing can read it again later, and a
@@ -604,6 +626,13 @@ def gate(
             reasons.append(
                 f"{other_id} is merged and its Verify is not recorded as passed (verify={other['fields'].get('verify')}); "
                 "nothing else of this run merges until it is: run `hl-verify` (after a fix-forward has merged and verified, `hl-verify --fixed-by`)"
+            )
+        waiting = queued_record(run_dir, other_id)
+        if waiting:
+            # It may merge at any moment, and its Verify has not run: what holds a merged item holds it.
+            reasons.append(
+                f"{other_id} waits in the merge queue (pull request #{waiting.get('pr')}, queued at {waiting.get('at')}): nothing else of this run merges "
+                f"until it has merged and its Verify passed, or is out of the queue. `hl-merge --id {other_id}` reads where it is"
             )
     # The same holds for an outside pull request this program merged into the repository (`hl-merge --outside`),
     # or began to merge and has no record of. A program that adopts none has no `outside/` directory in any run,
@@ -678,14 +707,27 @@ def gate(
     unexplained = not on_train and view["state"] == "OPEN" and not view.get("isDraft") and not not_green
     if state == "BLOCKED" and unexplained:
         state = settled_merge_state(tools, repo, slug, pr)
-    needs_update = state == "BEHIND"
+    needs_update = state == "BEHIND" and not queue
+    if state == "BEHIND" and queue:
+        warnings.append("the pull request is behind its base, which the merge queue tests it on: it is not brought up to date first")
     if state == "DIRTY":
         reasons.append("pull request conflicts with its base; the builder must resolve it and it must be graded again")
-    elif state not in MERGEABLE_STATES and not needs_update and view["state"] == "OPEN":
+    elif state not in MERGEABLE_STATES and state != "BEHIND" and view["state"] == "OPEN":
         warnings.append(f"merge state is {state}")
 
     if asked and not checks and not allow_no_required_checks:
         reasons.append("no required checks are reported for this pull request")
+    if skipped_widths and items.option(run, "text_fit_widths") == "recorded":
+        # Such a review counts only because the repository's own check measures every width; without it nothing does.
+        text_fit = (repo_facts or {}).get("text_fit_check")
+        held = {c.get("name") for c in checks}
+        if not text_fit or text_fit not in held:
+            why = f"the program's spec names no `text_fit_check` for {slug}" if not text_fit else f"`{text_fit}` is not among the checks this merge holds green ({', '.join(sorted(map(str, held))) or 'none'})"
+            reasons.append(
+                f"review {graded['n']}'s text-fit check did not answer {' or '.join(skipped_widths)}, and this run (`text_fit_widths: recorded`) lets that count "
+                f"only where the repository's own required text-fit check measures those widths: {why}. Review the head again with the check at every width "
+                f"(`hl-flow review --id {item_id}{' --full' if confirming else ''}`)"
+            )
     if not_green:
         reasons.append(("the checks this repository asks of an item" if on_train else "required checks") + " are not green: " + ", ".join(sorted(not_green)))
     elif state == "BLOCKED" and unexplained:
@@ -695,7 +737,14 @@ def gate(
 
     subject = f"{item_id}: {item['title']} (#{view['number']})"
     passed = f"Graded PASS at {head[:12]} (grade {graded['n']})"
-    if confirming:
+    if confirming and graded.get("red_checks") is not None:
+        # On one line each: a check's name is GitHub's, and a body line of its own would read as the kit's.
+        names = ", ".join(" ".join(str(check.get("name")).split()) for check in graded["red_checks"])
+        passed = (
+            f"Review {graded['confirms']} was a full review of {graded['from_sha'][:12]} and passed it, and required checks then came out red on it ({names}); "
+            f"review {graded['n']} confirmed the fix at {head[:12]}"
+        )
+    elif confirming:
         passed = f"Review {graded['confirms']} was a full review of {graded['from_sha'][:12]} and failed it; review {graded['n']} confirmed the fix at {head[:12]}"
     body = f"Item {item_id} of run {run['run_id']}.\n{passed}, contract {graded['contract_sha'][:12]}.\n"
     found = _attribution("the squash message", subject + "\n" + body)
@@ -754,6 +803,134 @@ def _already_merged(tools: Tools, repo, view: dict, graded: dict) -> dict:
         "needs_update": False,
         "warnings": [f"pull request #{view['number']} was already merged; this run only recorded it"],
     }
+
+
+# ---------------------------------------------------------------- a merge queue
+
+QUEUED = "QUEUED"
+REMOVED = "REMOVED-FROM-QUEUE"
+# Queued at one head, and merged at another, by something outside the gate.
+MERGED_ELSEWHERE = "MERGED-AT-ANOTHER-HEAD"
+EXIT_REMOVED = 6
+
+QUEUE_QUERY = """query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      id state headRefOid mergedAt mergeCommit { oid }
+      isMergeQueueEnabled isInMergeQueue mergeQueueEntry { id state position enqueuedAt }
+      timelineItems(last: 5, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
+        nodes { ... on RemovedFromMergeQueueEvent { createdAt reason beforeCommit { oid } } }
+      }
+    }
+  }
+}"""
+
+ENQUEUE = """mutation($id: ID!, $head: GitObjectID!) {
+  enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $head}) { mergeQueueEntry { id state position enqueuedAt } }
+}"""
+
+
+def queue_on(repo_facts: dict | None, on_train: bool) -> bool:
+    """Whether a merge into this repository goes through its base's merge
+    queue: the program's spec says so for the repository (`merge_queue:
+    true`), and the run does not merge into a train, whose branch has no
+    queue. Without the fact a merge is what it always was."""
+    return bool(repo_facts) and repo_facts.get("merge_queue") is True and not on_train
+
+
+def _graphql(tools: Tools, repo, query: str, fields: list[str], what: str) -> dict:
+    shown = tools.gh(["api", "graphql", "-f", f"query={query}", *fields], repo, check=False)
+    try:
+        answer = json.loads(shown.stdout or "{}")
+    except ValueError:
+        answer = {}
+    if shown.returncode != 0 or answer.get("errors") or not isinstance(answer.get("data"), dict):
+        said = "; ".join(str(e.get("message")) for e in answer.get("errors") or [] if isinstance(e, dict)) or shown.stderr.strip()
+        raise RuntimeError(f"{what}: {said[:300] or 'GitHub gave no answer'}")
+    return answer["data"]
+
+
+def queue_view(tools: Tools, repo, slug: str, pr) -> dict:
+    """What GitHub says of a pull request and the base's merge queue: whether
+    the base has one, whether the pull request is in it (its entry), whether
+    it merged (when, as what), and the last time it was taken out (`reason`)."""
+    owner, name = slug.split("/", 1)
+    data = _graphql(
+        tools, repo, QUEUE_QUERY, ["-f", f"owner={owner}", "-f", f"name={name}", "-F", f"number={int(pr)}"], f"could not read pull request #{pr}'s place in the merge queue"
+    )
+    node = (data.get("repository") or {}).get("pullRequest") or {}
+    if not node.get("id"):
+        raise RuntimeError(f"GitHub has no pull request #{pr} in {slug}")
+    removals = [n for n in ((node.get("timelineItems") or {}).get("nodes") or []) if isinstance(n, dict) and n.get("createdAt")]
+    return {
+        "id": node["id"],
+        "state": node.get("state"),
+        "head_sha": node.get("headRefOid"),
+        "merged_at": node.get("mergedAt"),
+        "merge_sha": (node.get("mergeCommit") or {}).get("oid"),
+        "queue_enabled": bool(node.get("isMergeQueueEnabled")),
+        "in_queue": bool(node.get("isInMergeQueue")),
+        "entry": node.get("mergeQueueEntry"),
+        "removals": removals,
+    }
+
+
+def queued_since(record: dict) -> str | None:
+    """When a queued record's pull request went into the queue: by GitHub's
+    clock where its answer said (`enqueuedAt`), else when the record was
+    written, which is just before the pull request was put in."""
+    return kit_time((record.get("entry") or {}).get("enqueuedAt")) or kit_time(record.get("at"))
+
+
+def removal_of(seen: dict, since: str | None) -> dict | None:
+    """The newest time GitHub took the pull request out of the queue since it
+    was put in at `since`. One from an earlier queueing explains nothing of
+    this one, so it is never given as this one's reason."""
+    later = [r for r in seen.get("removals") or [] if since is None or (kit_time(r.get("createdAt")) or "") >= since]
+    return later[-1] if later else None
+
+
+def removal_text(seen: dict, since: str | None = None) -> str:
+    """Why GitHub took a pull request out of the queue it went into at
+    `since`, in its own words, or that it has said nothing of it."""
+    if seen.get("state") == "CLOSED":
+        return "the pull request was closed"
+    removed = removal_of(seen, since) or {}
+    if removed.get("reason"):
+        return f"GitHub took it out at {removed.get('createdAt')}: {removed['reason']}"
+    return "GitHub shows it out of the queue and has recorded no reason since it was queued"
+
+
+def no_queue(slug: str, pr) -> Refusal:
+    return Refusal(
+        f"the program's spec says `merge_queue: true` for {slug}, and pull request #{pr}'s base has no merge queue (GitHub: "
+        "`isMergeQueueEnabled` is false): add one to the base's ruleset, or take the fact out of the spec and stage again"
+    )
+
+
+def enqueue(tools: Tools, repo, slug: str, pr, head_sha: str) -> dict:
+    """Put a pull request into its base's merge queue at exactly this head
+    (`expectedHeadOid`, as `--match-head-commit` pins a merge), unless it is
+    in already. Refuses where the base has no queue. Answers the entry."""
+    seen = queue_view(tools, repo, slug, pr)
+    if not seen["queue_enabled"]:
+        raise no_queue(slug, pr)
+    if seen["head_sha"] != head_sha:
+        raise Refusal(f"pull request #{pr}'s head is now {str(seen['head_sha'])[:12]}, not the {head_sha[:12]} the gate read: nothing was queued; run this again")
+    if seen["in_queue"] and seen["entry"]:
+        return seen["entry"]
+    data = _graphql(tools, repo, ENQUEUE, ["-f", f"id={seen['id']}", "-f", f"head={head_sha}"], f"could not put pull request #{pr} in the merge queue")
+    return (data.get("enqueuePullRequest") or {}).get("mergeQueueEntry") or {}
+
+
+def queued_record(run_dir, item_id: str) -> dict | None:
+    """The item's record while its pull request waits in the merge queue."""
+    path = items.item_dir(run_dir, item_id) / "merge.json"
+    try:
+        record = read_json(path) if path.exists() else None
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) and record.get("state") == QUEUED else None
 
 
 # ---------------------------------------------------------------- after a build
@@ -848,7 +1025,10 @@ def after_build(run_dir, item_id: str, repo, tools: Tools, pr: str | None = None
         except contractfmt.ContractError as exc:
             reasons.append(f"{report.name}: {exc}")
         else:
-            if (item.get("route") or {}).get("look") and contractfmt.noop_serve(how["serve"]):
+            look = bool((item.get("route") or {}).get("look"))
+            # Where the spec gives the repository's own serve command, a Serve line that starts nothing is served with it.
+            how = contractfmt.serving(how, look, (repo_facts or {}).get("serve"), item["fields"].get("port"))
+            if look and contractfmt.noop_serve(how["serve"]):
                 reasons.append(
                     f"{report.name}: this item is routed with a look, and its Serve line is `{how['serve'].strip()}`, which starts nothing. "
                     "A reviewer cannot look at a build that is not running: put the command that starts the real server on the port "
@@ -941,15 +1121,167 @@ def send_back(run_dir, item_id: str, reasons: list[str]) -> dict:
 # ---------------------------------------------------------------- merge
 
 
-def _record_merged(run_dir, item_id: str, repo, tools: Tools, slug: str, record: dict, merge_sha: str | None) -> dict:
-    """Write down a merge GitHub has made, and make the item merged."""
-    record.update(state="MERGED", merge_sha=merge_sha, at=utc_now())
+def _record_merged(run_dir, item_id: str, repo, tools: Tools, slug: str, record: dict, merge_sha: str | None, at: str | None = None) -> dict:
+    """Write down a merge GitHub has made, and make the item merged. `at` is
+    when GitHub merged it, where that was not just now (the merge queue's).
+    Refused, with nothing written, for an item that is not in progress: a
+    record that said MERGED would lift every hold its merge.json kept, and
+    the item could still not become merged, so nothing would check its
+    deploy."""
+    status = items.load_item(run_dir, item_id)["status"]
+    if status != "in_progress":
+        raise Refusal(
+            f"{item_id} is {status}, and pull request #{record['pr']} is merged as {merge_sha}: only an item in progress can become merged, "
+            f"so nothing was written and its merge.json holds the run as it did. Tell the operator: the merge has no record and no deploy check"
+        )
+    record.update(state="MERGED", merge_sha=merge_sha, at=at or utc_now())
     landed = tools.gh(["api", f"repos/{slug}/commits/{merge_sha}", "--jq", ".commit.message"], repo, check=False)
     # Nothing can take it back now; the manager files it and tells the operator.
     record["attribution_on_base"] = _attribution("the merged commit", landed.stdout) if landed.returncode == 0 else None
     write_json(items.item_dir(run_dir, item_id) / "merge.json", record)
-    items.set_status(run_dir, item_id, "merged", f"merged: PR #{record['pr']} as {merge_sha}")
+    how = "merged by the merge queue" if record.get("queued") else "merged"
+    items.set_status(run_dir, item_id, "merged", f"{how}: PR #{record['pr']} as {merge_sha}", at=at)
     return {"result": "merged", **record}
+
+
+def kit_time(stamp) -> str | None:
+    """A time GitHub gave, in the form the kit writes its own (`utc_now`), or None."""
+    try:
+        return datetime.strptime(str(stamp)[:19], "%Y-%m-%dT%H:%M:%S").strftime("%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+
+
+def _wait_next(root, run_dir, item_id: str) -> str:
+    where = _root_of(root, run_dir)
+    return f"hl-wait --root {where or '<root>'} --run-dir {Path(run_dir).resolve()} --queue {item_id}"
+
+
+def _queue_read(tools: Tools, repo, slug: str, pr) -> dict:
+    try:
+        return queue_view(tools, repo, slug, pr)
+    except RuntimeError as failed:
+        raise Refusal(f"{failed}: nothing was done; run this again") from failed
+
+
+def _queued_again(run_dir, item_id: str, repo, tools: Tools, run: dict, queued: dict, opts) -> tuple[int, dict] | None:
+    """An item whose pull request this script put in the merge queue, read
+    where it is now, whatever the spec says of the queue today. Answers what
+    to say, or None where a grade newer than the queued one goes on to the
+    gate (the pull request is out of the queue, and its new head is the one
+    to queue)."""
+    slug, pr = run["repo"], queued.get("pr")
+    seen = _queue_read(tools, repo, slug, pr)
+    d = items.item_dir(run_dir, item_id)
+    if seen["state"] == "MERGED":
+        if seen["head_sha"] != queued.get("head_sha"):
+            if not opts.dry_run:
+                # No longer QUEUED: the record holds nothing of the run any more, as a merge made outside the gate never
+                # did, and the item can be marked failed as this says.
+                write_json(
+                    d / "merge.json",
+                    {**queued, "state": MERGED_ELSEWHERE, "merged_head": seen["head_sha"], "merge_sha": seen["merge_sha"], "merged_at": seen["merged_at"], "read_at": utc_now()},
+                )
+            raise Refusal(
+                f"pull request #{pr} was merged at {str(seen['head_sha'])[:12]}, and {str(queued.get('head_sha'))[:12]} was the head put in the merge queue. "
+                "Nothing here records that as a merge: mark the item failed (`operator: merged outside the gate`) and tell the operator"
+            )
+        if opts.dry_run:
+            return 0, {"result": "queue-merged", "pr": pr, "merge_sha": seen["merge_sha"], "merged_at": seen["merged_at"]}
+        if not seen["merge_sha"]:
+            return 5, {"result": "merge-commit-unknown", "pr": pr, "next": f"GitHub has not named the merge commit yet: run `hl-merge --id {item_id}` again to record it"}
+        record = {
+            "pr": pr,
+            "head_sha": queued["head_sha"],
+            "graded_n": queued.get("graded_n"),
+            "queued": True,
+            "queued_at": queued.get("at"),
+            "entry": queued.get("entry"),
+        }
+        return 0, _record_merged(run_dir, item_id, repo, tools, slug, record, seen["merge_sha"], at=kit_time(seen["merged_at"]))
+    if seen["in_queue"]:
+        if seen["entry"] and not queued.get("entry") and not opts.dry_run:
+            # Queued by a run whose answer from GitHub was lost: GitHub's entry says when it went in.
+            queued = {**queued, "entry": seen["entry"]}
+            write_json(d / "merge.json", queued)
+        return 0, {"result": "queued", **queued, "entry": seen["entry"] or queued.get("entry"), "next": _wait_next(getattr(opts, "root", None), run_dir, item_id)}
+    since = queued_since(queued)
+    reason = removal_text(seen, since)
+    if not opts.dry_run:
+        # Said once, here; a QUEUED record no longer holds the rest of the run.
+        removed_at = (removal_of(seen, since) or {}).get("createdAt")
+        write_json(d / "merge.json", {**queued, "state": REMOVED, "reason": reason, "removed_at": removed_at, "read_at": utc_now()})
+    live = [e for e in items.load_attempts(run_dir, item_id)["log"] if not e.get("voided") and e["phase"] == "grade"]
+    if live and queued.get("graded_n") is not None and live[-1]["n"] > queued["graded_n"]:
+        return None
+    return EXIT_REMOVED, {
+        "result": "removed-from-queue",
+        "pr": pr,
+        "head_sha": queued.get("head_sha"),
+        "reason": reason,
+        "next": (
+            "a required check that failed in the merge group is a rework, as red checks are (build, grade, then `hl-merge`); a conflict with the base "
+            f"is a rebuild. Taken out for anything that was not the change (a cancelled group, a flake), `hl-merge --id {item_id}` queues the same head again"
+        ),
+    }
+
+
+def _enqueue_item(run_dir, item_id: str, repo, tools: Tools, run: dict, ctx: dict, opts) -> tuple[int, dict]:
+    """Put the item's pull request in the merge queue, under the lock. The
+    QUEUED record is written before GitHub is asked: GitHub may queue it
+    and the answer be lost, or this process die after it asked, and the
+    pull request may then merge at any moment. While the record stands it
+    holds the run and outside merges, and the next `hl-merge` reads where
+    the pull request really is. It is put back only where GitHub says
+    nothing was queued."""
+    path = items.item_dir(run_dir, item_id) / "merge.json"
+    before = path.read_text() if path.exists() else None
+    record = {"pr": ctx["pr"], "head_sha": ctx["head_sha"], "graded_n": ctx["graded_n"], "at": utc_now(), "state": QUEUED, "entry": None}
+    write_json(path, record)
+
+    def put_back():
+        if before is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(before)
+
+    try:
+        entry = enqueue(tools, repo, run["repo"], ctx["pr"], ctx["head_sha"])
+    except Refusal:
+        # Refused before anything was asked of the queue: nothing is under way.
+        put_back()
+        raise
+    except RuntimeError as failed:
+        try:
+            seen = queue_view(tools, repo, run["repo"], ctx["pr"])
+        except RuntimeError:
+            seen = None
+        if seen is not None and seen["in_queue"] and seen["head_sha"] == ctx["head_sha"]:
+            record["entry"] = seen["entry"]
+            write_json(path, record)
+            return 0, {
+                "result": "queued",
+                **record,
+                "warnings": ctx["warnings"] + [f"GitHub's answer to the queueing was an error ({str(failed)[:200]}), and it shows the pull request in the queue"],
+                "next": _wait_next(getattr(opts, "root", None), run_dir, item_id),
+            }
+        if seen is not None and seen["state"] == "OPEN" and not seen["in_queue"]:
+            # GitHub shows it open and not in the queue: nothing was queued.
+            failed_record = {k: v for k, v in record.items() if k != "entry"}
+            failed_record.update(state="MERGE-COMMAND-FAILED", detail=str(failed)[:600])
+            write_json(path, failed_record)
+            return 5, {"result": "merge-failed", **failed_record, "next": f"run `hl-merge --id {item_id}` again"}
+        # GitHub could not be read, or the pull request has moved on (merged, closed): the QUEUED record stands, and
+        # holds everything it would hold, until a run of `hl-merge` reads it.
+        return 5, {
+            "result": "merge-failed",
+            **record,
+            "detail": str(failed)[:600],
+            "next": f"run `hl-merge --id {item_id}` again: GitHub may have queued it, and it reads where it is",
+        }
+    record["entry"] = entry
+    write_json(path, record)
+    return 0, {"result": "queued", **record, "warnings": ctx["warnings"], "next": _wait_next(getattr(opts, "root", None), run_dir, item_id)}
 
 
 def merge(run_dir, item_id: str, repo, tools: Tools, opts) -> tuple[int, dict]:
@@ -965,6 +1297,16 @@ def merge(run_dir, item_id: str, repo, tools: Tools, opts) -> tuple[int, dict]:
     if items.on_train(run) and not run.get("repair"):
         # A run that repairs the train must be able to merge into a full one: it is what empties it.
         kwargs["train_ahead"] = _train_ahead(getattr(opts, "root", None), run_dir, run)
+    queue = queue_on(kwargs["repo_facts"], items.on_train(run))
+    if queue:
+        kwargs["queue"] = True
+
+    # A pull request this script put in the merge queue is where GitHub says it is, before anything is asked of the item.
+    queued = queued_record(run_dir, item_id)
+    if queued:
+        answered = _queued_again(run_dir, item_id, repo, tools, run, queued, opts)
+        if answered is not None:
+            return answered
 
     # Everything slow happens before the lock: the lock covers the merge only.
     ctx = gate(run_dir, item_id, repo, tools, **kwargs)
@@ -979,6 +1321,9 @@ def merge(run_dir, item_id: str, repo, tools: Tools, opts) -> tuple[int, dict]:
     if ctx["needs_update"]:
         return 4, {"result": "needs-update", **ctx}
     if opts.dry_run:
+        if queue and not _queue_read(tools, repo, run["repo"], ctx["pr"])["queue_enabled"]:
+            # The real run would be refused here: a dry run says so too.
+            raise no_queue(run["repo"], ctx["pr"])
         return 0, {"result": "dry-run-passed", **ctx}
 
     try:
@@ -999,6 +1344,8 @@ def merge(run_dir, item_id: str, repo, tools: Tools, opts) -> tuple[int, dict]:
             return 0, {**result, "warnings": ctx["warnings"]}
         if ctx["needs_update"]:
             return 4, {"result": "needs-update", **ctx}
+        if queue:
+            return _enqueue_item(run_dir, item_id, repo, tools, run, ctx, opts)
         merge_argv = ["pr", "merge", str(ctx["pr"]), "--repo", run["repo"], "--merge" if run.get("land") == "merge" else "--squash"]
         merge_argv += ["--match-head-commit", ctx["head_sha"]]
         merge_argv += ["--subject", ctx["subject"], "--body", ctx["body"]]

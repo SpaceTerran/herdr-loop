@@ -38,10 +38,15 @@ import time
 from pathlib import Path
 
 from . import archive, backlog, claim, clocks, contractfmt, herdr as herdr_mod, items, ledger, merge, program, review, seat, serve, spawn, train, verdict, wait
+from . import secrets as keeper
 from .common import Refusal, absolute, emit, read_json, utc_now, write_json
 from .herdr import Herdr, HerdrError
 
 SETUP_TIMEOUT_S = 30 * 60
+# What a repository's setup command is not given. It installs what the item's
+# pull request may have added (pip install, npm ci, terraform init), so their
+# install scripts run before any review: the loop's tokens stay out of reach.
+SETUP_WITHHELD = keeper.TOKEN_VARS + ("OP_SERVICE_ACCOUNT_TOKEN", "OP_CONNECT_TOKEN")
 SENT_BACK_BOUND = 2
 TAIL_LINES = 15
 
@@ -83,10 +88,12 @@ def setup_key(worktree, inputs) -> str:
 
 def run_setup(command: str, worktree, log: Path, timeout: float = SETUP_TIMEOUT_S) -> dict:
     """Run the repository's setup command in a worktree, under bash, with its
-    output in a log beside the item. Everything it starts ends with it."""
+    output in a log beside the item. Everything it starts ends with it, and
+    none of it is given the loop's tokens (SETUP_WITHHELD)."""
     started = time.time()
+    env = {key: value for key, value in os.environ.items() if key not in SETUP_WITHHELD}
     with open(log, "wb") as out:
-        proc = subprocess.Popen(["/bin/bash", "-c", command], cwd=str(worktree), stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+        proc = subprocess.Popen(["/bin/bash", "-c", command], cwd=str(worktree), env=env, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
         try:
             code = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -237,6 +244,8 @@ def prepare(root, run_dir, item_id: str, tools, opts) -> tuple[int, dict]:
         "criteria": item.get("accept_count"),
         "has_verify": bool(item.get("verify_command")),
         "item_file": str(d / "item.md"),
+        # The Scope and markers of the item file, which the manager otherwise reads by hand to route it.
+        **{k: v for k, v in items.item_text(run_dir, item_id).items() if k in ("scope", "markers")},
         "branch": branch,
         "worktree": str(worktree),
         "worktree_made": made,
@@ -523,6 +532,7 @@ def comment_text(item_id: str, n: int, data: dict, checked: dict, seen: dict | N
             f"The reviewer's transcript shows {seen.get('ran', 0)} commands that ran something, {seen.get('served_calls', 0)} calls on the "
             f"served build and {seen.get('served_pages', 0)} of its pages opened in the browser."
             + (f" Its own commands showed it the fix's diff of {seen['fix_files_shown']} of the {seen['fix_files']} files the fix changes." if "fix_files" in seen else "")
+            + (f" The text-fit check answered at {', '.join(map(str, seen['text_fit_widths']))} px." if seen.get("text_fit_widths") else "")
         )
     return "\n".join(lines) + "\n"
 
@@ -561,7 +571,7 @@ def reviewed(root, run_dir, item_id: str, tools, herdr, host, opts) -> tuple[int
         out.update(fix_list=checked.get("fix_list"), criteria_in_question=checked.get("criteria_in_question") or [], by_checks=checked.get("by_checks") or [])
         # Findings of kind `criterion` that name no criterion: notes about the item's own text, kept for follow-up and corrected nowhere.
         out["criterion_notes"] = checked.get("criterion_notes") or 0
-        out["exercise"] = {k: seen.get(k) for k in ("ran", "served_calls", "served_pages", "looks", "exercised", "looked", "look_required", "sub_agents")}
+        out["exercise"] = {k: seen.get(k) for k in ("ran", "served_calls", "served_pages", "looks", "exercised", "looked", "look_required", "sub_agents", "text_fit_widths")}
         if checked.get("confirms"):
             # A delta confirm: which review's fix list it answered and how, and how much of the fix its transcript shows it was shown.
             out.update(confirms=checked["confirms"], answers=checked["answers"], delta=checked["delta"])
@@ -690,7 +700,28 @@ def context_tokens(root) -> int | None:
     return last
 
 
-def save(root, pid: int, procs, note: str, git=None, no_token: str | None = None, outside_facts=None, ci_facts=None) -> tuple[int, dict]:
+def watched_logs(watch: list, now: float | None = None) -> list[dict]:
+    """Each log a program names in `watch_logs`: how many minutes since it was last written, and `stale` once that
+    passes the entry's `stale_minutes`. A log that is not there, or cannot be read, is `stale` too. The work such a
+    log records runs outside the program (a loader, an import), so nothing else here would see it stop: on
+    the help-desk catalog program (2026-11-14) the sample loader stopped and the program learned of it about 67 hours later,
+    while "Now" still called it running. A fact for the manager: nothing here restarts anything."""
+    now = time.time() if now is None else now
+    out = []
+    for entry in watch or []:
+        path = Path(str(entry.get("path") or ""))
+        row = {"what": entry.get("what") or path.name, "path": str(path), "stale_minutes": entry.get("stale_minutes")}
+        try:
+            minutes = max(0, int((now - path.stat().st_mtime) // 60))
+        except OSError as exc:
+            out.append({**row, "minutes": None, "stale": True, "error": f"{type(exc).__name__}: {exc.strerror or exc}"[:200]})
+            continue
+        limit = entry.get("stale_minutes")
+        out.append({**row, "minutes": minutes, "stale": isinstance(limit, (int, float)) and minutes > limit})
+    return out
+
+
+def save(root, pid: int, procs, note: str, git=None, no_token: str | None = None, outside_facts=None, ci_facts=None, velocity_facts=None) -> tuple[int, dict]:
     """Write the generated ledger files, commit and push the ledger, and
     stamp the heartbeat. Refused, before anything is written, when the
     program is no longer this manager's.
@@ -713,10 +744,14 @@ def save(root, pid: int, procs, note: str, git=None, no_token: str | None = None
     seen in the cycle it crosses the budget. `ci_facts` is that read
     (`pace.facts_or_said`); it cannot fail the save either.
 
-    And it says which streams have no item in progress, since when, and how
+    And it says which streams have no item being worked, since when, and how
     many items wait in their runs (`idle`, `ledger.idle_streams`), read from
-    the run directories alone. What an idle stream should do is the
-    manager's to decide; this only makes sure it is seen at every save.
+    the run directories alone; a stream whose only items passed review and
+    wait to merge is among them (`waiting_to_merge`). What an idle stream
+    should do is the manager's to decide; this only makes sure it is seen at
+    every save. Where the program names logs of work outside it
+    (`watch_logs`), it says how long since each was written (`logs`,
+    `watched_logs`), a fact that cannot fail the save either.
 
     Last, it names what is still open and waits on a clock, a reading or
     another run closing (`clocks`, hl/clocks.py): the runs whose file's
@@ -724,7 +759,12 @@ def save(root, pid: int, procs, note: str, git=None, no_token: str | None = None
     ledger's Gates table that are not settled. Nothing waits to see whether
     it fixes itself (the operator, 2026-11-10); which wait protects a person
     is the manager's to say. A fact like the others: it cannot fail the
-    save."""
+    save.
+
+    And it says how long a passed item waits to merge and what a merged
+    item costs (`velocity`, hl/velocity.py): the numbers an operator's note
+    keeps or reverts a change on. `velocity_facts` is that read
+    (`velocity.facts_or_said`); it cannot fail the save either."""
     cfg = program.load(root)
     claim._require_mine(root, pid, procs)
     ledger_file = cfg.get("ledger")
@@ -790,6 +830,11 @@ def save(root, pid: int, procs, note: str, git=None, no_token: str | None = None
         out["idle"] = ledger.idle_streams(root, cfg.get("streams") or {}, at)
     except Exception as exc:  # noqa: BLE001 - a fact, never a failed save
         out["idle"] = {"errors": [f"could not be read: {exc}"[:300]]}
+    if cfg.get("watch_logs"):
+        try:
+            out["logs"] = watched_logs(cfg["watch_logs"])
+        except Exception as exc:  # noqa: BLE001 - a fact, never a failed save
+            out["logs"] = {"errors": [f"could not be read: {exc}"[:300]]}
     try:
         out["clocks"] = clocks.program_clocks(root, ledger_file)
     except Exception as exc:  # noqa: BLE001 - a fact, never a failed save
@@ -817,6 +862,11 @@ def save(root, pid: int, procs, note: str, git=None, no_token: str | None = None
             out["ci_time"] = ci_facts()
         except Exception as exc:  # noqa: BLE001 - a fact, never a failed save
             out["ci_time"] = {"errors": [f"could not be read: {exc}"[:300]]}
+    if velocity_facts is not None:
+        try:
+            out["velocity"] = velocity_facts()
+        except Exception as exc:  # noqa: BLE001 - a fact, never a failed save
+            out["velocity"] = {"errors": [f"could not be read: {exc}"[:300]]}
     return (0 if out["pushed"] else 2), out
 
 
@@ -930,7 +980,14 @@ def main(argv: list[str] | None = None, herdr=None, host=None, tools=None, procs
 
                 return pace.facts_or_said(args.root, no_token=no_token)
 
-            code, result = save(args.root, pid, procs, args.note, no_token=no_token, outside_facts=outside_facts, ci_facts=ci_facts)
+            def velocity_facts():
+                from . import velocity  # here, and inside the read: nothing about it may fail the save
+
+                return velocity.facts_or_said(args.root)
+
+            code, result = save(
+                args.root, pid, procs, args.note, no_token=no_token, outside_facts=outside_facts, ci_facts=ci_facts, velocity_facts=velocity_facts
+            )
             emit(result)
             return code
         if args.cmd == "archive":
